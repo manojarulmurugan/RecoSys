@@ -33,8 +33,6 @@ data/
 *.csv
 *.parquet
 processed/
-.ipynb_checkpoints/
-*.ipynb
 .env
 .env.local
 *.log
