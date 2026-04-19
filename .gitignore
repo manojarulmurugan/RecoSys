@@ -27,7 +27,7 @@ wheels/
 *.swo
 *~
 .DS_Store
-data/
+artifacts/
 *.jsonl
 *.jsonl.gz
 *.csv
