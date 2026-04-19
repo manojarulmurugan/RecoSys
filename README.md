@@ -12,8 +12,9 @@ An end-to-end personalized recommendation engine built on the REES46 eCommerce c
 | 2 | Exploratory data analysis (BigQuery + Spark) | ✅ Complete |
 | 3 | Spark preprocessing pipeline (Dataproc) | ✅ Complete |
 | 4 | Sampling, temporal splits, interaction tables | ✅ Complete |
-| 5 | Model training (ALS / BPR / two-tower) | 🔲 Next |
-| 6 | Evaluation and serving | 🔲 Planned |
+| 5 | Two-Tower model — 50k experiments complete | ✅ Complete |
+| 6 | Two-Tower model — 500k GPU training | 🔲 Next |
+| 7 | Evaluation and serving | 🔲 Planned |
 
 ---
 
@@ -140,6 +141,57 @@ All matrices are >99.99 % sparse — consistent with implicit feedback datasets.
 
 ---
 
+## Phase 5 — Two-Tower Model (50k experiments)
+
+**Model:** Neural retrieval with user tower + item tower + FAISS
+**Location:** `src/two_tower/`, `scripts/two_tower/`
+
+| Experiment | Config | Best Recall@10 |
+|---|---|---|
+| Baseline (v2) | batch=1024, temp=0.05, no weighting | 0.0097 |
+| Confidence weighted (v3) | batch=1024, temp=0.05, weighted | 0.0098 |
+
+**Key findings:**
+- Confidence weighting: neutral on 50k — difference of 0.0001
+- 50k ceiling confirmed at ~0.010 regardless of config
+- FAISS index must be scoped to trained items only
+- Ground truth: cart + purchase events (not purchases only)
+- Bottleneck is data scale — moving to 500k GPU training next
+
+---
+
+## Repository layout — Two-Tower
+
+```
+src/
+├── data/
+│   ├── __init__.py
+│   └── feature_builder.py       # shared: vocab + feature encoding
+└── two_tower/
+    ├── __init__.py
+    ├── data/
+    │   └── dataset.py           # TwoTowerDataset, build_full_item_tensors
+    ├── models/
+    │   └── two_tower.py         # UserTower, ItemTower, TwoTowerModel
+    ├── training/
+    │   └── train.py             # in_batch_loss, train_epoch, train
+    └── evaluation/
+        └── evaluate.py          # build_faiss_index, evaluate
+
+scripts/two_tower/
+├── build_item_features.py       # BigQuery: item feature table
+├── build_user_features.py       # BigQuery: user feature table (50k)
+├── build_user_features_500k.py  # BigQuery: user feature table (500k)
+├── build_features_local.py      # encode + validate artifacts (50k)
+├── build_features_local_500k.py # encode + validate artifacts (500k)
+├── train_two_tower.py           # training entry point (50k)
+├── evaluate_two_tower.py        # checkpoint sweep evaluation
+├── sanity_check_model.py        # forward-pass + loss sanity check
+└── diagnose_evaluation.py       # per-user retrieval diagnostics
+```
+
+---
+
 ## GCS bucket layout
 
 ```
@@ -206,6 +258,3 @@ Install with:
 ```bash
 pip install -r requirements.txt
 ```
-End-to-end recommendation system built on 285M real eCommerce events (views, cart-adds, purchases). Uses Apache Spark for data processing, ALS / Session-Based GRU / Two-Tower models for recommendations, and a full MLOps layer with MLflow, DVC, and FastAPI on GCP.
-
-**Currently**: EDA & data exploration phase.
