@@ -206,6 +206,122 @@ def build_seen_items(
     return seen
 
 
+# ── Per-user diagnostic printer ───────────────────────────────────────────────
+
+def _print_per_user_diagnostics(
+    eval_users:    list[int],
+    gt_sizes:      list[int],
+    recall_scores: list[float],
+    seen_items:    dict[int, set],
+    k:             int,
+) -> None:
+    """Print four per-user diagnostic blocks after the aggregate metrics.
+
+    (1) Ground truth density  — distribution of how many GT items each user has.
+    (2) Hit rate              — % of users with ≥1 correct item in top-k.
+    (3) Recall distribution   — for users who *do* get a hit, spread of Recall@k.
+    (4) Zero-hit profile      — avg GT size and training interactions for users
+                                with zero hits (cold-start vs warm failure).
+
+    Args:
+        eval_users:    Ordered list of user_idx values that were evaluated.
+        gt_sizes:      Per-user GT item counts, aligned with eval_users.
+        recall_scores: Per-user Recall@k values, aligned with eval_users.
+        seen_items:    Dict user_idx → set of item_idxs seen during training.
+        k:             Recommendation list length (for display only).
+    """
+    if not eval_users:
+        return
+
+    gt_arr     = np.array(gt_sizes,       dtype=np.float32)
+    recall_arr = np.array(recall_scores,  dtype=np.float32)
+    hit_arr    = (recall_arr > 0)          # bool mask: True iff ≥1 hit
+
+    n_users   = len(eval_users)
+    n_hits    = int(hit_arr.sum())
+    n_zero    = n_users - n_hits
+
+    sep  = "─" * 52
+    head = "═" * 52
+
+    print(f"\n{head}")
+    print(f"  PER-USER DIAGNOSTICS")
+    print(head)
+
+    # ── (1) Ground truth density ───────────────────────────────────────────
+    n_one_gt  = int((gt_arr == 1).sum())
+    pct_one   = 100.0 * n_one_gt / n_users
+
+    print(f"\n  (1) GROUND TRUTH DENSITY  (GT items per eval user)")
+    print(f"  {sep}")
+    print(f"  {'min':<18}: {int(gt_arr.min()):>6}")
+    print(f"  {'median':<18}: {np.median(gt_arr):>6.1f}")
+    print(f"  {'mean':<18}: {gt_arr.mean():>6.2f}")
+    print(f"  {'90th percentile':<18}: {np.percentile(gt_arr, 90):>6.1f}")
+    print(f"  {'max':<18}: {int(gt_arr.max()):>6}")
+    print(f"  {'users with 1 GT item':<18}: {n_one_gt:>6,}  ({pct_one:.1f}% of eval users)")
+
+    # ── (2) Hit rate ────────────────────────────────────────────────────────
+    hit_rate = 100.0 * n_hits / n_users
+
+    print(f"\n  (2) HIT RATE  (users with ≥1 hit in top-{k})")
+    print(f"  {sep}")
+    print(f"  {'Users with ≥1 hit':<28}: {n_hits:>6,}  ({hit_rate:.1f}%)")
+    print(f"  {'Users with zero hits':<28}: {n_zero:>6,}  ({100.0 - hit_rate:.1f}%)")
+    print(f"  Note: Recall@{k} averages over all users; hit rate counts binary success.")
+
+    # ── (3) Recall distribution — hit users only ────────────────────────────
+    print(f"\n  (3) RECALL@{k} DISTRIBUTION  (hit users only, n={n_hits:,})")
+    print(f"  {sep}")
+    if n_hits == 0:
+        print(f"  No users achieved any hits.")
+    else:
+        hit_recall = recall_arr[hit_arr]
+        print(f"  {'mean':<18}: {hit_recall.mean():>6.4f}")
+        print(f"  {'median':<18}: {np.median(hit_recall):>6.4f}")
+        print(f"  {'75th percentile':<18}: {np.percentile(hit_recall, 75):>6.4f}")
+        n_perfect = int((hit_recall >= (1.0 / k - 1e-9)).sum())
+        print(f"  {'users @ max recall':<18}: {n_perfect:>6,}  "
+              f"(Recall@{k} = {1.0/min(1, k):.2f}, i.e. ≥1 hit in 1 GT item)")
+
+    # ── (4) Zero-hit user profile ────────────────────────────────────────────
+    print(f"\n  (4) ZERO-HIT USER PROFILE  (n={n_zero:,})")
+    print(f"  {sep}")
+    if n_zero == 0:
+        print(f"  All eval users achieved at least one hit.")
+    else:
+        zero_mask = ~hit_arr
+        zero_gt   = gt_arr[zero_mask]
+
+        # Count training interactions per zero-hit user
+        zero_train_counts = np.array(
+            [len(seen_items.get(u, set())) for u, is_zero
+             in zip(eval_users, zero_mask) if is_zero],
+            dtype=np.float32,
+        )
+
+        print(f"  {'Avg GT items':<30}: {zero_gt.mean():>6.2f}  "
+              f"(all-user avg: {gt_arr.mean():.2f})")
+        print(f"  {'Avg training interactions':<30}: {zero_train_counts.mean():>6.1f}")
+        print(f"  {'Median training interactions':<30}: {np.median(zero_train_counts):>6.1f}")
+
+        cold_start = int((zero_train_counts <= 5).sum())
+        pct_cold   = 100.0 * cold_start / n_zero
+        warm_fail  = n_zero - cold_start
+        pct_warm   = 100.0 * warm_fail / n_zero
+        print(f"  {'≤5 train interactions (cold)':<30}: {cold_start:>6,}  ({pct_cold:.1f}%)")
+        print(f"  {'>5 train interactions (warm)':<30}: {warm_fail:>6,}  ({pct_warm:.1f}%)")
+        if pct_warm > 50:
+            print(f"\n  Note: majority of zero-hit users are WARM — the model has")
+            print(f"  training signal for them but fails to retrieve their GT items.")
+            print(f"  This points to model quality issues, not cold-start data gaps.")
+        else:
+            print(f"\n  Note: majority of zero-hit users are COLD-START — limited")
+            print(f"  training signal is the primary driver of zero-hit failures.")
+
+    print(f"\n{head}\n")
+
+
 # ── Full Evaluation ───────────────────────────────────────────────────────────
 
 def evaluate(
@@ -305,6 +421,8 @@ def evaluate(
     recall_scores:    list[float] = []
     ndcg_scores:      list[float] = []
     precision_scores: list[float] = []
+    gt_sizes:         list[int]   = []   # per-user GT item count, aligned with eval_users
+    all_recommendations: dict[int, list[int]] = {}
 
     model.eval()
     with torch.no_grad():
@@ -328,6 +446,7 @@ def evaluate(
             for i, user_idx in enumerate(batch_user_idxs):
                 raw_positions = faiss_indices[i]
 
+                recommended_item_idxs:  list[int] = []
                 recommended_product_ids: list[int] = []
                 user_seen = seen_items.get(user_idx, set())
 
@@ -340,9 +459,13 @@ def evaluate(
                     prod_id = idx2item.get(iidx)
                     if prod_id is None:
                         continue
+                    recommended_item_idxs.append(iidx)
                     recommended_product_ids.append(prod_id)
 
+                all_recommendations[user_idx] = recommended_item_idxs[:k]
+
                 gt = ground_truth[user_idx]
+                gt_sizes.append(len(gt))
                 recall_scores.append(recall_at_k(recommended_product_ids, gt, k))
                 ndcg_scores.append(ndcg_at_k(recommended_product_ids, gt, k))
                 precision_scores.append(precision_at_k(recommended_product_ids, gt, k))
@@ -353,7 +476,7 @@ def evaluate(
     mean_precision = float(np.mean(precision_scores)) if precision_scores else 0.0
     n_eval_users   = len(eval_users)
 
-    # ── Step 7: Print ─────────────────────────────────────────────────────────
+    # ── Step 7: Print aggregate metrics ──────────────────────────────────────
     print(f"\n{'═' * 38}")
     print(f"Evaluation Results (k={k})")
     print(f"{'═' * 38}")
@@ -363,9 +486,19 @@ def evaluate(
     print(f"  Precision@{k:<1}         : {mean_precision:.4f}")
     print(f"{'═' * 38}")
 
+    # ── Step 8: Per-user diagnostics ──────────────────────────────────────────
+    _print_per_user_diagnostics(
+        eval_users   = eval_users,
+        gt_sizes     = gt_sizes,
+        recall_scores = recall_scores,
+        seen_items   = seen_items,
+        k            = k,
+    )
+
     return {
         f"recall@{k}":    mean_recall,
         f"ndcg@{k}":      mean_ndcg,
         f"precision@{k}": mean_precision,
         "n_eval_users":   n_eval_users,
+        "recommendations": all_recommendations,
     }

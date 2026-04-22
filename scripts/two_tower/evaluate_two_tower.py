@@ -3,6 +3,7 @@ import os
 import pathlib
 import pickle
 import sys
+from collections import Counter
 
 import pandas as pd
 import torch
@@ -57,6 +58,71 @@ item_tower = ItemTower(
 model = TwoTowerModel(user_tower, item_tower, temperature=0.05)
 model.to(DEVICE)
 
+# ── Popularity Collapse Diagnostic ───────────────────────────────────────────
+
+def check_popularity_collapse(
+    all_recommendations: dict,
+    k: int = 10,
+) -> None:
+    """Print a popularity-collapse diagnostic for a set of per-user top-K lists.
+
+    Flattens all recommendation lists, counts how often each item appears
+    across all users, then reports what share of total recommendation slots
+    is accounted for by the top-1 / 5 / 10 / 50 / 100 most-recommended items.
+
+    A healthy retrieval model should spread recommendations across hundreds or
+    thousands of distinct items.  If the top-50 items absorb more than ~20% of
+    all slots across tens of thousands of users, the model is collapsing onto
+    a small set of popular items regardless of user preferences.
+
+    Args:
+        all_recommendations: dict mapping user_idx -> list of top-K item_idxs.
+        k:                   List length per user (used only for display).
+    """
+    flat        = [item for recs in all_recommendations.values() for item in recs[:k]]
+    total_slots = len(flat)
+    n_users     = len(all_recommendations)
+    n_unique    = len(set(flat))
+
+    if total_slots == 0:
+        print("  [check_popularity_collapse] No recommendations to analyse.")
+        return
+
+    most_common = Counter(flat).most_common()   # sorted by count descending
+
+    thresholds = [1, 5, 10, 50, 100]
+
+    print(f"\n{'=' * 58}")
+    print(f"{'POPULARITY COLLAPSE DIAGNOSTIC':^58}")
+    print(f"{'=' * 58}")
+    print(f"  Users evaluated              : {n_users:>10,}")
+    print(f"  Total recommendation slots   : {total_slots:>10,}  (users x {k})")
+    print(f"  Unique items ever recommended: {n_unique:>10,}")
+    print()
+    print(f"  {'Top-N items':<20}  {'Cumulative slots':>16}  {'% of total':>10}")
+    print(f"  {'-'*20}  {'-'*16}  {'-'*10}")
+
+    cumulative = 0
+    prev       = 0
+    top50_pct  = 0.0
+    for t in thresholds:
+        cumulative += sum(count for _, count in most_common[prev:t])
+        pct         = 100.0 * cumulative / total_slots
+        print(f"  Top-{t:<16}  {cumulative:>16,}  {pct:>9.2f}%")
+        if t == 50:
+            top50_pct = pct
+        prev = t
+
+    print(f"{'=' * 58}")
+    if top50_pct > 20.0:
+        print(f"  COLLAPSE WARNING : top-50 items cover {top50_pct:.1f}% of slots "
+              f"(threshold > 20%)")
+    else:
+        print(f"  OK               : top-50 items cover {top50_pct:.1f}% of slots "
+              f"(threshold > 20%)")
+    print(f"{'=' * 58}\n")
+
+
 # ── Evaluate each checkpoint ──────────────────────────────────────────────────
 all_results: list[dict] = []
 
@@ -85,6 +151,10 @@ for epoch in EVAL_EPOCHS:
         device           = torch.device(DEVICE),
         k                = K,
     )
+
+    # Extract per-user recommendations before the float-conversion below
+    all_recs = metrics.pop("recommendations", {})
+    check_popularity_collapse(all_recs, k=K)
 
     all_results.append({
         "checkpoint": str(ckpt_path),
