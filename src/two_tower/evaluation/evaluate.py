@@ -332,12 +332,17 @@ def evaluate(
     train_pairs_df: pd.DataFrame,
     vocabs: dict[str, Any],
     device: torch.device,
-    k: int = 10,
     batch_size: int = 512,
-    n_faiss_candidates: int = 50,
+    n_faiss_candidates: int = 100,
     trained_item_idxs: set | np.ndarray | None = None,
 ) -> dict[str, Any]:
     """End-to-end retrieval evaluation using FAISS nearest-neighbour search.
+
+    Always computes Recall@10, NDCG@10, Recall@20, and NDCG@20 from a single
+    FAISS search pass.  FAISS retrieves `n_faiss_candidates` neighbours per
+    user; seen-item filtering is applied once; metrics at both cutoffs are
+    derived from the same filtered list — no second forward pass or index
+    search is needed.
 
     Only users that satisfy *all* of the following are evaluated:
       - Had a cart or purchase event in the test split.
@@ -347,6 +352,10 @@ def evaluate(
     The FAISS index is restricted to items that appeared in training when
     trained_item_idxs is provided (or auto-derived from train_pairs_df),
     removing noise from uninitialised item embeddings.
+
+    Returns:
+        Dict with keys: recall_10, ndcg_10, recall_20, ndcg_20,
+        n_eval_users, recommendations.
     """
 
     # ── Metric helpers ────────────────────────────────────────────────────────
@@ -418,9 +427,10 @@ def evaluate(
     # ── Step 5: Batch retrieval and metric computation ────────────────────────
     idx2item: dict[int, int] = vocabs["idx2item"]
 
-    recall_scores:    list[float] = []
-    ndcg_scores:      list[float] = []
-    precision_scores: list[float] = []
+    recall_scores_10: list[float] = []
+    ndcg_scores_10:   list[float] = []
+    recall_scores_20: list[float] = []
+    ndcg_scores_20:   list[float] = []
     gt_sizes:         list[int]   = []   # per-user GT item count, aligned with eval_users
     all_recommendations: dict[int, list[int]] = {}
 
@@ -462,43 +472,47 @@ def evaluate(
                     recommended_item_idxs.append(iidx)
                     recommended_product_ids.append(prod_id)
 
-                all_recommendations[user_idx] = recommended_item_idxs[:k]
+                all_recommendations[user_idx] = recommended_item_idxs[:20]
 
                 gt = ground_truth[user_idx]
                 gt_sizes.append(len(gt))
-                recall_scores.append(recall_at_k(recommended_product_ids, gt, k))
-                ndcg_scores.append(ndcg_at_k(recommended_product_ids, gt, k))
-                precision_scores.append(precision_at_k(recommended_product_ids, gt, k))
+                recall_scores_10.append(recall_at_k(recommended_product_ids, gt, 10))
+                ndcg_scores_10.append(ndcg_at_k(recommended_product_ids, gt, 10))
+                recall_scores_20.append(recall_at_k(recommended_product_ids, gt, 20))
+                ndcg_scores_20.append(ndcg_at_k(recommended_product_ids, gt, 20))
 
     # ── Step 6: Aggregate ─────────────────────────────────────────────────────
-    mean_recall    = float(np.mean(recall_scores))   if recall_scores    else 0.0
-    mean_ndcg      = float(np.mean(ndcg_scores))     if ndcg_scores      else 0.0
-    mean_precision = float(np.mean(precision_scores)) if precision_scores else 0.0
+    mean_recall_10 = float(np.mean(recall_scores_10)) if recall_scores_10 else 0.0
+    mean_ndcg_10   = float(np.mean(ndcg_scores_10))   if ndcg_scores_10   else 0.0
+    mean_recall_20 = float(np.mean(recall_scores_20)) if recall_scores_20 else 0.0
+    mean_ndcg_20   = float(np.mean(ndcg_scores_20))   if ndcg_scores_20   else 0.0
     n_eval_users   = len(eval_users)
 
     # ── Step 7: Print aggregate metrics ──────────────────────────────────────
-    print(f"\n{'═' * 38}")
-    print(f"Evaluation Results (k={k})")
-    print(f"{'═' * 38}")
+    print(f"\n{'═' * 44}")
+    print(f"Evaluation Results")
+    print(f"{'═' * 44}")
     print(f"  Eval users          : {n_eval_users:,}")
-    print(f"  Recall@{k:<3}          : {mean_recall:.4f}")
-    print(f"  NDCG@{k:<5}          : {mean_ndcg:.4f}")
-    print(f"  Precision@{k:<1}         : {mean_precision:.4f}")
-    print(f"{'═' * 38}")
+    print(f"  Recall@10           : {mean_recall_10:.4f}")
+    print(f"  NDCG@10             : {mean_ndcg_10:.4f}")
+    print(f"  Recall@20           : {mean_recall_20:.4f}")
+    print(f"  NDCG@20             : {mean_ndcg_20:.4f}")
+    print(f"{'═' * 44}")
 
-    # ── Step 8: Per-user diagnostics ──────────────────────────────────────────
+    # ── Step 8: Per-user diagnostics (based on @10) ────────────────────────
     _print_per_user_diagnostics(
-        eval_users   = eval_users,
-        gt_sizes     = gt_sizes,
-        recall_scores = recall_scores,
-        seen_items   = seen_items,
-        k            = k,
+        eval_users    = eval_users,
+        gt_sizes      = gt_sizes,
+        recall_scores = recall_scores_10,
+        seen_items    = seen_items,
+        k             = 10,
     )
 
     return {
-        f"recall@{k}":    mean_recall,
-        f"ndcg@{k}":      mean_ndcg,
-        f"precision@{k}": mean_precision,
-        "n_eval_users":   n_eval_users,
+        "recall_10":       mean_recall_10,
+        "ndcg_10":         mean_ndcg_10,
+        "recall_20":       mean_recall_20,
+        "ndcg_20":         mean_ndcg_20,
+        "n_eval_users":    n_eval_users,
         "recommendations": all_recommendations,
     }

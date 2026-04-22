@@ -204,7 +204,8 @@ def train(
         log_every:                Batch logging frequency inside each epoch.
         eval_every:               If > 0, call `eval_fn(model)` every N epochs.
         eval_fn:                  Optional callable taking the model and returning
-                                  a metrics dict (expected keys: 'recall@10', 'ndcg@10').
+                                  a metrics dict (expected keys: 'recall_10', 'ndcg_10',
+                                  'recall_20', 'ndcg_20').
         lr_eta_min:               Minimum learning rate at the end of cosine decay.
         use_confidence_weighting: If True, scale each pair's loss by its normalised
                                   confidence score (purchases outweigh views).
@@ -253,8 +254,10 @@ def train(
 
         if eval_every > 0 and eval_fn is not None and epoch % eval_every == 0:
             metrics = eval_fn(model)
-            print(f"  → Recall@10: {metrics.get('recall@10', 0):.4f}  "
-                  f"NDCG@10: {metrics.get('ndcg@10', 0):.4f}")
+            print(f"  → Recall@10: {metrics.get('recall_10', 0):.4f}  "
+                  f"NDCG@10: {metrics.get('ndcg_10', 0):.4f}  "
+                  f"Recall@20: {metrics.get('recall_20', 0):.4f}  "
+                  f"NDCG@20: {metrics.get('ndcg_20', 0):.4f}")
 
         torch.save(
             {

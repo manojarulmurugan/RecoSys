@@ -149,7 +149,6 @@ for epoch in EVAL_EPOCHS:
         train_pairs_df   = train_pairs,
         vocabs           = vocabs,
         device           = torch.device(DEVICE),
-        k                = K,
     )
 
     # Extract per-user recommendations before the float-conversion below
@@ -164,22 +163,24 @@ for epoch in EVAL_EPOCHS:
     })
 
 # ── Summary table ─────────────────────────────────────────────────────────────
-print(f"\n{'=' * 62}")
-print(f"{'CHECKPOINT SWEEP SUMMARY':^62}")
-print(f"{'=' * 62}")
-print(f"  {'Epoch':<8}  {'Train Loss':>10}  {'Recall@10':>10}  {'NDCG@10':>9}  {'Prec@10':>8}")
-print(f"  {'-'*8}  {'-'*10}  {'-'*10}  {'-'*9}  {'-'*8}")
+print(f"\n{'=' * 74}")
+print(f"{'CHECKPOINT SWEEP SUMMARY':^74}")
+print(f"{'=' * 74}")
+print(f"  {'Epoch':<8}  {'Train Loss':>10}  {'Recall@10':>10}  {'NDCG@10':>9}"
+      f"  {'Recall@20':>10}  {'NDCG@20':>9}")
+print(f"  {'-'*8}  {'-'*10}  {'-'*10}  {'-'*9}  {'-'*10}  {'-'*9}")
 
-best = max(all_results, key=lambda r: r.get(f"recall@{K}", 0)) if all_results else None
+best = max(all_results, key=lambda r: r.get("recall_10", 0)) if all_results else None
 
 for r in all_results:
-    marker = "  ← best" if r is best else ""
+    marker = "  ← best Recall@10" if r is best else ""
     print(f"  {r['epoch']:<8}  {r['train_loss']:>10.4f}  "
-          f"{r.get(f'recall@{K}', 0):>10.4f}  "
-          f"{r.get(f'ndcg@{K}', 0):>9.4f}  "
-          f"{r.get(f'precision@{K}', 0):>8.4f}"
+          f"{r.get('recall_10', 0):>10.4f}  "
+          f"{r.get('ndcg_10', 0):>9.4f}  "
+          f"{r.get('recall_20', 0):>10.4f}  "
+          f"{r.get('ndcg_20', 0):>9.4f}"
           f"{marker}")
-print(f"{'=' * 62}")
+print(f"{'=' * 74}")
 
 # ── Save all results ──────────────────────────────────────────────────────────
 eval_results_path = ARTIFACTS_DIR / "eval_results.json"
@@ -189,4 +190,5 @@ with open(eval_results_path, "w") as f:
 print(f"\nAll results saved to {eval_results_path}")
 if best:
     print(f"Best checkpoint : epoch_{best['epoch']}.pt  "
-          f"Recall@{K}={best[f'recall@{K}']:.4f}")
+          f"Recall@10={best['recall_10']:.4f}  "
+          f"Recall@20={best['recall_20']:.4f}")

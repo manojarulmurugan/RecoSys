@@ -73,7 +73,6 @@ eval_callback = functools.partial(
     train_pairs_df   = train_pairs,
     vocabs           = vocabs,
     device           = torch.device(DEVICE),
-    k                = 10,
 )
 
 # ── Train ─────────────────────────────────────────────────────────────────────
