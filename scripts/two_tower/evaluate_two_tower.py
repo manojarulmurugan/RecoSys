@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import pathlib
@@ -10,17 +11,53 @@ import torch
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(
-    _REPO_ROOT / "secrets" / "recosys-service-account.json"
-)
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-ARTIFACTS_DIR   = _REPO_ROOT / "artifacts" / "50k"
-CHECKPOINT_DIR  = ARTIFACTS_DIR / "checkpoints_v2"
-EVAL_EPOCHS     = [5, 10, 15, 20, 25, 30]   # checkpoints to evaluate
-TEST_GCS_PATH   = "gs://recosys-data-bucket/samples/users_sample_50k/test/"
-DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
-K               = 10
+# Optional service-account JSON for reading test parquet from GCS (gcloud ADC also works)
+_gac = _REPO_ROOT / "secrets" / "recosys-service-account.json"
+if _gac.is_file():
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(_gac)
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Evaluate Two-Tower checkpoints (Recall / NDCG) against GCS test split."
+    )
+    p.add_argument(
+        "--artifacts-dir",
+        type=pathlib.Path,
+        default=_REPO_ROOT / "artifacts" / "500k",
+        help="Directory with vocabs.pkl, *encoded.parquet, train_pairs.parquet (default: repo artifacts/500k)",
+    )
+    p.add_argument(
+        "--checkpoint-subdir",
+        type=str,
+        default="checkpoints",
+        help="Subfolder of artifacts-dir with epoch_*.pt files (default: checkpoints)",
+    )
+    p.add_argument(
+        "--epochs",
+        type=int,
+        nargs="+",
+        default=[5, 30],
+        help="Which epoch_*.pt files to run (default: 5 30)",
+    )
+    p.add_argument(
+        "--test-gcs-path",
+        type=str,
+        default="gs://recosys-data-bucket/samples/users_sample_500k/test/",
+        help="Parquet test split on GCS (default: 500k sample)",
+    )
+    return p.parse_args()
+
+
+# ── CONFIG (defaults suitable for 500k local checkpoints under artifacts/500k/checkpoints/) ──
+_args = _parse_args()
+ARTIFACTS_DIR: pathlib.Path = _args.artifacts_dir.resolve()
+CHECKPOINT_DIR = ARTIFACTS_DIR / _args.checkpoint_subdir
+EVAL_EPOCHS: list[int] = list(_args.epochs)
+TEST_GCS_PATH: str = _args.test_gcs_path
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+K = 10
 
 # ── Load shared artifacts (once) ──────────────────────────────────────────────
 print("Loading artifacts...")

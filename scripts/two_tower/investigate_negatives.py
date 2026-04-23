@@ -231,6 +231,23 @@ def _parse_args() -> argparse.Namespace:
         default=2048,
         help="Pairs per simulated training batch (default: 2048).",
     )
+    p.add_argument(
+        "--mode",
+        choices=[
+            "category_granularity",
+            "session_negatives",
+            "negative_difficulty",
+            "false_negative_risk",
+            "intra_category_scores",
+        ],
+        default=None,
+        help=(
+            "Run a single investigation instead of all of them.  "
+            "Choices: category_granularity, session_negatives, negative_difficulty, "
+            "false_negative_risk, intra_category_scores.  "
+            "When omitted, all analyses run (legacy behaviour)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -1837,7 +1854,9 @@ def main() -> None:
     print(_SEP)
     print(f"  Hard-Negative Mining Analysis")
     print(f"  Artifacts : {artifacts_dir}")
-    if not args.skip_session:
+    if args.mode:
+        print(f"  Mode      : {args.mode}")
+    if not args.skip_session and args.mode in (None, "session_negatives"):
         print(f"  Train path: {args.train_path}")
     print(_SEP)
 
@@ -1846,7 +1865,64 @@ def main() -> None:
     print(f"\n  items_encoded shape : {items_encoded_df.shape}")
     print(f"  train_pairs shape   : {train_pairs_df.shape}")
 
-    # ── Part A: category granularity ─────────────────────────────────────────
+    # ── Single-mode dispatch ──────────────────────────────────────────────────
+    if args.mode == "category_granularity":
+        analyze_category_granularity(
+            items_encoded_df=items_encoded_df,
+            train_pairs_df=train_pairs_df,
+            sample_size=args.sample_size,
+            seed=args.seed,
+            vocabs=vocabs,
+        )
+        return
+
+    if args.mode == "session_negatives":
+        analyze_session_negatives(
+            args.train_path,
+            items_encoded_df=items_encoded_df,
+            artifacts_dir=artifacts_dir,
+            seed=args.seed,
+        )
+        return
+
+    if args.mode == "negative_difficulty":
+        analyze_negative_difficulty(
+            train_pairs_df=train_pairs_df,
+            items_encoded_df=items_encoded_df,
+            n_batches=args.n_batches,
+            batch_size=args.batch_size,
+            seed=args.seed,
+        )
+        return
+
+    if args.mode == "false_negative_risk":
+        assess_false_negative_risk(
+            train_pairs_df=train_pairs_df,
+            items_encoded_df=items_encoded_df,
+            n_users=args.n_fn_users,
+            top_k_popular=args.top_popular,
+            seed=args.seed,
+        )
+        return
+
+    if args.mode == "intra_category_scores":
+        ckpt_path = (
+            pathlib.Path(args.checkpoint).resolve()
+            if args.checkpoint
+            else artifacts_dir / "checkpoints" / "epoch_5.pt"
+        )
+        analyze_intra_category_scores(
+            checkpoint_path=ckpt_path,
+            items_encoded_df=items_encoded_df,
+            train_pairs_df=train_pairs_df,
+            artifacts_dir=artifacts_dir,
+            seed=args.seed,
+        )
+        return
+
+    # ── Legacy: run all analyses when --mode is not provided ─────────────────
+
+    # Part A: category granularity
     analyze_category_granularity(
         items_encoded_df=items_encoded_df,
         train_pairs_df=train_pairs_df,
@@ -1855,7 +1931,7 @@ def main() -> None:
         vocabs=vocabs,
     )
 
-    # ── Part B: session-based negatives ──────────────────────────────────────
+    # Part B: session-based negatives
     if args.skip_session:
         print("  (--skip-session set: skipping analyze_session_negatives)")
     else:
@@ -1866,7 +1942,7 @@ def main() -> None:
             seed=args.seed,
         )
 
-    # ── Part C: false negative risk ──────────────────────────────────────────
+    # Part C: false negative risk
     if args.skip_fn_risk:
         print("  (--skip-fn-risk set: skipping assess_false_negative_risk)")
     else:
@@ -1878,7 +1954,7 @@ def main() -> None:
             seed=args.seed,
         )
 
-    # ── Part D: intra-category score distribution ────────────────────────────
+    # Part D: intra-category score distribution
     if args.skip_scoring:
         print("  (--skip-scoring set: skipping analyze_intra_category_scores)")
     else:
@@ -1895,7 +1971,7 @@ def main() -> None:
             seed=args.seed,
         )
 
-    # ── Part E: in-batch negative difficulty ─────────────────────────────────
+    # Part E: in-batch negative difficulty
     if args.skip_difficulty:
         print("  (--skip-difficulty set: skipping analyze_negative_difficulty)")
         return

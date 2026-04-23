@@ -516,3 +516,276 @@ def evaluate(
         "n_eval_users":    n_eval_users,
         "recommendations": all_recommendations,
     }
+
+
+# ── Stratified Evaluation ─────────────────────────────────────────────────────
+
+def evaluate_stratified(
+    model: TwoTowerModel,
+    items_encoded_df: pd.DataFrame,
+    users_encoded_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    train_pairs_df: pd.DataFrame,
+    vocabs: dict[str, Any],
+    device: torch.device,
+    batch_size: int = 512,
+    n_faiss_candidates: int = 100,
+    trained_item_idxs: set | np.ndarray | None = None,
+) -> dict[str, Any]:
+    """End-to-end retrieval evaluation broken down by training-interaction cohort.
+
+    Runs a single FAISS search pass (identical to evaluate) and partitions
+    results into three cohorts defined by each user's number of training
+    interactions:
+
+        Cold   :  3 – 10  interactions
+        Medium : 11 – 50  interactions
+        Warm   : 51+       interactions
+
+    For each cohort and overall, reports:
+        Recall@10, NDCG@10, Recall@20, NDCG@20, hit rate (% users ≥1 hit @10),
+        and cohort size.
+
+    The FAISS index and ground-truth dict are built once — no per-cohort rebuild.
+
+    Args:
+        model:              Trained TwoTowerModel.
+        items_encoded_df:   Full item feature DataFrame.
+        users_encoded_df:   User feature DataFrame from FeatureBuilder.
+        test_df:            Raw test-split events DataFrame.
+        train_pairs_df:     Training pairs with columns [user_idx, item_idx].
+                            Used to compute per-user training interaction counts
+                            and to build the seen-items filter.
+        vocabs:             Vocab dict containing user2idx / idx2item.
+        device:             Torch device for inference.
+        batch_size:         Users and items per forward pass.
+        n_faiss_candidates: Neighbours retrieved from FAISS before filtering.
+        trained_item_idxs:  Optional set of item_idx values to include in the
+                            index. Auto-derived from train_pairs_df if None.
+
+    Returns:
+        Dict with keys:
+            'overall'  → {recall_10, ndcg_10, recall_20, ndcg_20,
+                          hit_rate_10, n_users}
+            'cold'     → same structure
+            'medium'   → same structure
+            'warm'     → same structure
+            'recommendations' → {user_idx: [item_idx, …]}
+    """
+
+    # ── Cohort boundaries ─────────────────────────────────────────────────────
+    COHORTS: list[tuple[str, int, int]] = [
+        ("cold",   3,  10),
+        ("medium", 11, 50),
+        ("warm",   51, int(1e9)),
+    ]
+
+    # ── Metric helpers (mirrors evaluate) ─────────────────────────────────────
+    def recall_at_k(predicted: list, ground_truth: set, k: int) -> float:
+        hits = len(set(predicted[:k]) & ground_truth)
+        return hits / min(len(ground_truth), k)
+
+    def ndcg_at_k(predicted: list, ground_truth: set, k: int) -> float:
+        dcg = sum(
+            1.0 / np.log2(i + 2)
+            for i, item in enumerate(predicted[:k])
+            if item in ground_truth
+        )
+        ideal_hits = min(len(ground_truth), k)
+        idcg = sum(1.0 / np.log2(i + 2) for i in range(ideal_hits))
+        return dcg / idcg if idcg > 0 else 0.0
+
+    # ── Step 0: Training interaction counts ───────────────────────────────────
+    train_interaction_counts: dict[int, int] = (
+        train_pairs_df.groupby("user_idx").size().to_dict()
+    )
+
+    # ── Step 1: Build FAISS index once ────────────────────────────────────────
+    if trained_item_idxs is None:
+        trained_item_idxs = set(train_pairs_df["item_idx"].unique().tolist())
+        print(f"Auto-derived trained_item_idxs: {len(trained_item_idxs):,} items")
+
+    embeddings, item_idx_array = build_faiss_index(
+        model, items_encoded_df, device,
+        trained_item_idxs=trained_item_idxs,
+        batch_size=batch_size,
+    )
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+
+    # ── Step 2: Ground truth ──────────────────────────────────────────────────
+    valid_user_idxs: set[int] = set(users_encoded_df["user_idx"].astype(int).tolist())
+    ground_truth = build_ground_truth(test_df, vocabs["user2idx"], valid_user_idxs)
+    eval_users   = list(ground_truth.keys())
+    print(f"Evaluating on {len(eval_users):,} users")
+
+    # ── Step 3: Seen items ────────────────────────────────────────────────────
+    seen_items = build_seen_items(train_pairs_df)
+
+    # ── Step 4: User feature lookup arrays ────────────────────────────────────
+    n_users = int(users_encoded_df["user_idx"].max()) + 1
+
+    user_cat_arr = np.zeros((n_users, 4), dtype=np.int64)
+    user_cat_arr[users_encoded_df["user_idx"].values] = users_encoded_df[
+        ["top_cat_idx", "peak_hour_bucket", "preferred_dow", "has_purchase_history"]
+    ].values.astype(np.int64)
+
+    user_dense_arr = np.zeros((n_users, 6), dtype=np.float32)
+    user_dense_arr[users_encoded_df["user_idx"].values] = users_encoded_df[
+        ["log_total_events", "months_active", "purchase_rate", "cart_rate",
+         "log_n_sessions", "avg_purchase_price_scaled"]
+    ].values.astype(np.float32)
+
+    # ── Step 5: Inference — single pass over all eval users ───────────────────
+    idx2item: dict[int, int] = vocabs["idx2item"]
+
+    # Per-user storage (aligned with eval_users ordering)
+    per_user_recall_10: list[float] = []
+    per_user_ndcg_10:   list[float] = []
+    per_user_recall_20: list[float] = []
+    per_user_ndcg_20:   list[float] = []
+    all_recommendations: dict[int, list[int]] = {}
+
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, len(eval_users), batch_size):
+            batch_user_idxs = eval_users[start : start + batch_size]
+
+            uid_tensor   = torch.tensor(batch_user_idxs, dtype=torch.long, device=device)
+            cat_tensor   = torch.tensor(
+                user_cat_arr[batch_user_idxs], dtype=torch.long, device=device
+            )
+            dense_tensor = torch.tensor(
+                user_dense_arr[batch_user_idxs], dtype=torch.float32, device=device
+            )
+
+            user_embs    = model.get_user_embedding(uid_tensor, cat_tensor, dense_tensor)
+            user_embs_np = user_embs.cpu().numpy().astype(np.float32)
+            faiss.normalize_L2(user_embs_np)
+
+            _, faiss_indices = index.search(user_embs_np, n_faiss_candidates)
+
+            for i, user_idx in enumerate(batch_user_idxs):
+                raw_positions = faiss_indices[i]
+
+                recommended_item_idxs:   list[int] = []
+                recommended_product_ids: list[int] = []
+                user_seen = seen_items.get(user_idx, set())
+
+                for pos in raw_positions:
+                    if pos < 0:
+                        continue
+                    iidx = int(item_idx_array[pos])
+                    if iidx in user_seen:
+                        continue
+                    prod_id = idx2item.get(iidx)
+                    if prod_id is None:
+                        continue
+                    recommended_item_idxs.append(iidx)
+                    recommended_product_ids.append(prod_id)
+
+                all_recommendations[user_idx] = recommended_item_idxs[:20]
+
+                gt = ground_truth[user_idx]
+                per_user_recall_10.append(recall_at_k(recommended_product_ids, gt, 10))
+                per_user_ndcg_10.append(ndcg_at_k(recommended_product_ids, gt, 10))
+                per_user_recall_20.append(recall_at_k(recommended_product_ids, gt, 20))
+                per_user_ndcg_20.append(ndcg_at_k(recommended_product_ids, gt, 20))
+
+    # ── Step 6: Partition into cohorts ────────────────────────────────────────
+    def _cohort_metrics(mask: np.ndarray) -> dict[str, float]:
+        """Aggregate metrics for the users selected by boolean mask."""
+        n = int(mask.sum())
+        if n == 0:
+            return {
+                "recall_10": 0.0, "ndcg_10": 0.0,
+                "recall_20": 0.0, "ndcg_20": 0.0,
+                "hit_rate_10": 0.0, "n_users": 0,
+            }
+        r10 = np.array(per_user_recall_10, dtype=np.float32)[mask]
+        n10 = np.array(per_user_ndcg_10,   dtype=np.float32)[mask]
+        r20 = np.array(per_user_recall_20, dtype=np.float32)[mask]
+        n20 = np.array(per_user_ndcg_20,   dtype=np.float32)[mask]
+        return {
+            "recall_10":   float(r10.mean()),
+            "ndcg_10":     float(n10.mean()),
+            "recall_20":   float(r20.mean()),
+            "ndcg_20":     float(n20.mean()),
+            "hit_rate_10": float((r10 > 0).mean()) * 100.0,
+            "n_users":     n,
+        }
+
+    # Build a per-user training count array aligned with eval_users
+    train_counts_arr = np.array(
+        [train_interaction_counts.get(u, 0) for u in eval_users], dtype=np.int64
+    )
+
+    overall_mask = np.ones(len(eval_users), dtype=bool)
+    results: dict[str, Any] = {
+        "overall":         _cohort_metrics(overall_mask),
+        "recommendations": all_recommendations,
+    }
+    for name, lo, hi in COHORTS:
+        mask = (train_counts_arr >= lo) & (train_counts_arr <= hi)
+        results[name] = _cohort_metrics(mask)
+
+    # ── Step 7: Print side-by-side cohort table ───────────────────────────────
+    col_names = ["overall"] + [c[0] for c in COHORTS]
+    col_w     = 12   # width of each data column
+
+    metrics_rows: list[tuple[str, str]] = [
+        ("n_users",    "N users"),
+        ("recall_10",  "Recall@10"),
+        ("ndcg_10",    "NDCG@10"),
+        ("recall_20",  "Recall@20"),
+        ("ndcg_20",    "NDCG@20"),
+        ("hit_rate_10", "Hit rate@10 %"),
+    ]
+    cohort_labels = {
+        "overall": "Overall",
+        "cold":    "Cold (3-10)",
+        "medium":  "Med (11-50)",
+        "warm":    "Warm (51+)",
+    }
+    label_w = max(len(v) for _, v in metrics_rows) + 2
+
+    sep   = "═" * (label_w + (col_w + 2) * len(col_names) + 1)
+    thin  = "─" * (label_w + (col_w + 2) * len(col_names) + 1)
+
+    def _fmt(key: str, val: float | int) -> str:
+        if key == "n_users":
+            return f"{int(val):>{col_w},}"
+        if key == "hit_rate_10":
+            return f"{val:>{col_w}.1f}"
+        return f"{val:>{col_w}.4f}"
+
+    print(f"\n{sep}")
+    print(f"  STRATIFIED EVALUATION RESULTS")
+    print(sep)
+
+    # Header row
+    header = f"  {'Metric':<{label_w}}"
+    for c in col_names:
+        header += f"  {cohort_labels[c]:>{col_w}}"
+    print(header)
+    print(thin)
+
+    # Cohort size row (interactions range)
+    range_row = f"  {'Interactions':<{label_w}}"
+    ranges = {"overall": "all", "cold": "3–10", "medium": "11–50", "warm": "51+"}
+    for c in col_names:
+        range_row += f"  {ranges[c]:>{col_w}}"
+    print(range_row)
+    print(thin)
+
+    # Metric rows
+    for key, label in metrics_rows:
+        row = f"  {label:<{label_w}}"
+        for c in col_names:
+            val = results[c][key]
+            row += f"  {_fmt(key, val)}"
+        print(row)
+
+    print(sep)
+
+    return results

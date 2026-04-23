@@ -17,7 +17,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from src.two_tower.data.dataset import TwoTowerDataset, build_full_item_tensors
+from src.two_tower.data.dataset import (
+    TwoTowerDataset,
+    TwoTowerDatasetWithHardNegs,
+    build_full_item_tensors,
+)
 from src.two_tower.models.two_tower import TwoTowerModel
 
 
@@ -54,6 +58,45 @@ def in_batch_loss(
     per_sample_loss = F.cross_entropy(scores, labels, reduction="none")
     norm_weights = confidence_weights / confidence_weights.mean()
     return (per_sample_loss * norm_weights).mean()
+
+
+def in_batch_loss_with_hard_negs(
+    user_embs: torch.Tensor,
+    pos_item_embs: torch.Tensor,
+    hard_neg_item_embs: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """In-batch negative cross-entropy loss augmented with pre-mined hard negatives.
+
+    For each user i the logits contain:
+      • B in-batch scores  (diagonal entry i is the true positive)
+      • 3 hard-negative scores appended as extra columns
+
+    The label for every row is still i (the diagonal positive), so standard
+    cross-entropy over the enlarged (B, B+K) matrix is correct.
+
+    Args:
+        user_embs:          (B, 64) L2-normalised user embeddings.
+        pos_item_embs:      (B, 64) L2-normalised positive item embeddings.
+        hard_neg_item_embs: (B, K, 64) L2-normalised hard negative embeddings.
+        temperature:        Softmax temperature scalar.
+
+    Returns:
+        Scalar cross-entropy loss.
+    """
+    B = user_embs.size(0)
+
+    # (B, B) — standard in-batch similarity matrix
+    S_inbatch = (user_embs @ pos_item_embs.T) / temperature
+
+    # (B, K) — each user dot-producted against its own K hard negatives
+    S_hard = torch.einsum("bd,bkd->bk", user_embs, hard_neg_item_embs) / temperature
+
+    # (B, B+K) — hard negs appended as extra negative columns
+    S = torch.cat([S_inbatch, S_hard], dim=1)
+
+    labels = torch.arange(B, device=user_embs.device)
+    return F.cross_entropy(S, labels)
 
 
 # ── Single Epoch ──────────────────────────────────────────────────────────────
@@ -102,6 +145,89 @@ def train_epoch(
             loss = in_batch_loss(scores, conf)
         else:
             loss = in_batch_loss(scores)
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+        if (batch_idx + 1) % log_every == 0:
+            print(f"  batch {batch_idx + 1}/{total_batches} — loss: {loss.item():.4f}")
+
+    return total_loss / total_batches
+
+
+def train_epoch_with_hard_negs(
+    model: TwoTowerModel,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    temperature: float,
+    device: torch.device,
+    log_every: int = 100,
+) -> float:
+    """Run one full training epoch using pre-mined hard negatives.
+
+    Mirrors train_epoch exactly, with three additions:
+      1. Unpacks ``batch['hard_neg_idxs']`` — shape (B, K) of item indices.
+      2. Resolves hard-neg feature tensors from the dataset's pre-built numpy
+         lookup arrays (``dataset._item_cat`` / ``dataset._item_dense``),
+         the same arrays used to serve positive item features in __getitem__.
+      3. Calls in_batch_loss_with_hard_negs instead of in_batch_loss.
+
+    The DataLoader must wrap a TwoTowerDatasetWithHardNegs instance.
+
+    Args:
+        model:       TwoTowerModel instance.
+        dataloader:  DataLoader built from TwoTowerDatasetWithHardNegs.
+        optimizer:   Optimiser (e.g. AdamW).
+        temperature: Softmax temperature passed to in_batch_loss_with_hard_negs.
+        device:      Target device.
+        log_every:   Print a progress line every this many batches.
+
+    Returns:
+        Mean loss across all batches in the epoch.
+    """
+    model.train()
+    total_loss    = 0.0
+    total_batches = len(dataloader)
+
+    # Cache the numpy feature arrays once — same arrays backing __getitem__
+    item_cat_arr   = dataloader.dataset._item_cat    # (n_items, 5) int64
+    item_dense_arr = dataloader.dataset._item_dense  # (n_items, 3) float32
+
+    for batch_idx, batch in enumerate(dataloader):
+        user_idx   = batch["user_idx"].to(device)
+        user_cat   = batch["user_cat"].to(device)
+        user_dense = batch["user_dense"].to(device)
+        item_cat   = batch["item_cat"].to(device)
+        item_dense = batch["item_dense"].to(device)
+
+        # hard_neg_idxs: (B, K) int64 — item indices for pre-mined hard negatives
+        hard_neg_idxs = batch["hard_neg_idxs"]   # keep on CPU for numpy indexing
+        B, K = hard_neg_idxs.shape
+
+        # Resolve hard-neg features using the same lookup arrays as __getitem__
+        flat_idxs = hard_neg_idxs.reshape(-1).numpy()          # (B*K,)
+        hn_cat_t   = torch.tensor(
+            item_cat_arr[flat_idxs], dtype=torch.long
+        ).to(device)                                             # (B*K, 5)
+        hn_dense_t = torch.tensor(
+            item_dense_arr[flat_idxs], dtype=torch.float32
+        ).to(device)                                             # (B*K, 3)
+
+        optimizer.zero_grad()
+
+        # Encode users and positive items (mirrors model.forward internals)
+        user_embs     = model.user_tower(user_idx, user_cat, user_dense)  # (B, 64)
+        pos_item_embs = model.item_tower(item_cat, item_dense)             # (B, 64)
+
+        # Encode all hard negatives in one batched pass, then reshape
+        hn_embs_flat  = model.item_tower(hn_cat_t, hn_dense_t)            # (B*K, 64)
+        hard_neg_embs = hn_embs_flat.view(B, K, -1)                       # (B, K, 64)
+
+        loss = in_batch_loss_with_hard_negs(
+            user_embs, pos_item_embs, hard_neg_embs, temperature
+        )
 
         loss.backward()
         optimizer.step()
