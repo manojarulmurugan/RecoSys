@@ -1,13 +1,16 @@
-"""Two-Tower training script v2 — hard negatives + stratified evaluation.
+"""Two-Tower training script v3 — Tier-1 quality fixes.
 
-Changes vs train_two_tower.py:
-  - Uses TwoTowerDatasetWithHardNegs (cat_l2 primary / price_bucket fallback)
-    when USE_HARD_NEGATIVES=True; falls back to TwoTowerDataset otherwise.
-  - Calls train_epoch_with_hard_negs / train_epoch accordingly.
-  - Split AdamW param groups: embeddings get weight_decay=0, MLP layers keep it.
-  - Runs both evaluate() and evaluate_stratified() every EVAL_EVERY epochs.
-  - Checkpoints are zero-padded (epoch_05.pt, epoch_10.pt, …).
-  - Appends a row to checkpoints_v2_aware/training_log.json after every eval.
+Changes vs train_two_tower_v2.py:
+  - No hard negatives: uses plain TwoTowerDataset (removes false-neg pollution).
+  - LogQ correction: subtracts log(q(item)) from in-batch logits to remove
+    popularity bias (YouTube Two-Tower paper, 2019).
+  - Confidence weighting ON: purchases contribute more gradient than views.
+  - Label smoothing 0.1: prevents overconfident predictions.
+  - Batch size 4096: more in-batch negatives per step (A100 handles this fine).
+  - Temperature 0.07: slightly warmer than v2's 0.05, better for sparse users.
+  - Checkpoint dir: checkpoints_v3 — clean separation from v1/v2 runs.
+  - Keeps: split AdamW param groups, stratified eval, zero-padded checkpoints,
+    training_log.json, _ensure_gcp_credentials.
 """
 
 import json
@@ -16,6 +19,7 @@ import pathlib
 import pickle
 import sys
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -28,9 +32,9 @@ sys.path.insert(0, str(_REPO_ROOT))
 def _ensure_gcp_credentials() -> None:
     """Point GOOGLE_APPLICATION_CREDENTIALS at a readable key file.
 
-    On Colab the JSON is often uploaded to `/content/` or the repo root, not
-    under ``secrets/``.  If the env var is already set and the file exists,
-    we leave it alone.  Otherwise we try common locations in order.
+    On Colab the JSON is often uploaded to ``/content/`` or the repo root.
+    If the env var is already set and the file exists, we leave it alone.
+    Otherwise we try common locations in order.
     """
     existing = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if existing and pathlib.Path(existing).expanduser().is_file():
@@ -56,27 +60,23 @@ def _ensure_gcp_credentials() -> None:
 
 _ensure_gcp_credentials()
 
-# Import evaluation (pulls in faiss) *before* heavy I/O / hard-negative mining so a
-# missing ``faiss`` install fails fast instead of after a long CPU mine.
+# Import evaluation (pulls in faiss) early so a missing install fails fast.
 from src.two_tower.evaluation.evaluate import evaluate, evaluate_stratified
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 ARTIFACTS_DIR  = _REPO_ROOT / "artifacts" / "500k"
 TEST_GCS_PATH  = "gs://recosys-data-bucket/samples/users_sample_500k/test/"
-# Pre-mined hard negatives (~180 MB for 7.5M×3 int64). After one successful run,
-# re-starts skip mining and load from this file instead.
-HARD_NEG_CACHE_PATH = ARTIFACTS_DIR / "hard_neg_idxs_aware_seed42.npy"
 
-USE_HARD_NEGATIVES = True
-HARD_NEG_RATIO     = 3
-TEMPERATURE        = 0.05
-BATCH_SIZE         = 2048
-LEARNING_RATE      = 1e-3
-WEIGHT_DECAY       = 1e-5
-N_EPOCHS           = 40
-EVAL_EVERY         = 5
-CHECKPOINT_DIR     = _REPO_ROOT / "artifacts" / "500k" / "checkpoints_v2_aware"
-DEVICE             = "cuda" if torch.cuda.is_available() else "cpu"
+USE_CONFIDENCE_WEIGHTING = True
+LABEL_SMOOTHING          = 0.1
+TEMPERATURE              = 0.07   # warmer than v2's 0.05; better for sparse users
+BATCH_SIZE               = 4096
+LEARNING_RATE            = 1e-3
+WEIGHT_DECAY             = 1e-5
+N_EPOCHS                 = 30
+EVAL_EVERY               = 5
+CHECKPOINT_DIR           = _REPO_ROOT / "artifacts" / "500k" / "checkpoints_v3"
+DEVICE                   = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # ── Optimizer: split embedding vs MLP params ──────────────────────────────────
@@ -124,7 +124,32 @@ print(f"Loading test split from {TEST_GCS_PATH} ...")
 test_df = pd.read_parquet(TEST_GCS_PATH)
 print(f"  test_df        : {test_df.shape}")
 print(f"  device         : {DEVICE}")
-print(f"  hard negatives : {USE_HARD_NEGATIVES}  (ratio: {HARD_NEG_RATIO})")
+print(f"  conf weighting : {USE_CONFIDENCE_WEIGHTING}")
+print(f"  label smoothing: {LABEL_SMOOTHING}")
+print(f"  temperature    : {TEMPERATURE}")
+print(f"  batch size     : {BATCH_SIZE}")
+
+# ── LogQ correction array ─────────────────────────────────────────────────────
+# Pre-compute log(q(item)) for every item_idx, where q(item) is the empirical
+# sampling probability in training pairs.  During each batch, the values for
+# the B current items are looked up and subtracted from the logit matrix before
+# cross-entropy — this removes the popularity bias inherent in in-batch
+# negatives (YouTube Two-Tower paper, 2019, section 4).
+print("\nBuilding LogQ correction array...")
+item_counts   = train_pairs["item_idx"].value_counts()
+n_total_pairs = len(train_pairs)
+n_items_max   = int(items_enc["item_idx"].max()) + 1
+
+# Default: log(1 / n_items_max) for items never seen in training pairs.
+log_q_arr = np.full(n_items_max, fill_value=np.log(1.0 / n_items_max), dtype=np.float32)
+for item_idx_val, count in item_counts.items():
+    log_q_arr[int(item_idx_val)] = float(np.log(count / n_total_pairs))
+
+print(
+    f"  LogQ array  : {n_items_max:,} items  "
+    f"min={log_q_arr.min():.3f}  max={log_q_arr.max():.3f}  "
+    f"mean={log_q_arr.mean():.3f}"
+)
 
 # ── Build model ───────────────────────────────────────────────────────────────
 from src.two_tower.models.two_tower import ItemTower, TwoTowerModel, UserTower
@@ -146,21 +171,10 @@ device = torch.device(DEVICE)
 model.to(device)
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
-from src.two_tower.data.dataset import TwoTowerDataset, TwoTowerDatasetWithHardNegs
+from src.two_tower.data.dataset import TwoTowerDataset
 
-if USE_HARD_NEGATIVES:
-    dataset = TwoTowerDatasetWithHardNegs(
-        train_pairs_df      = train_pairs,
-        users_encoded_df    = users_enc,
-        items_encoded_df    = items_enc,
-        n_hard_negs         = HARD_NEG_RATIO,
-        seed                = 42,
-        hard_neg_cache_path = HARD_NEG_CACHE_PATH,
-    )
-    print(dataset)
-else:
-    dataset = TwoTowerDataset(train_pairs, users_enc, items_enc)
-    print(f"TwoTowerDataset: {len(dataset):,} pairs")
+dataset = TwoTowerDataset(train_pairs, users_enc, items_enc)
+print(f"TwoTowerDataset: {len(dataset):,} pairs")
 
 dataloader = DataLoader(
     dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0
@@ -168,11 +182,7 @@ dataloader = DataLoader(
 print(f"  Batches/epoch : {len(dataloader):,}")
 
 # ── Optimizer + scheduler ─────────────────────────────────────────────────────
-from src.two_tower.training.train import (
-    in_batch_loss,
-    train_epoch,
-    train_epoch_with_hard_negs,
-)
+from src.two_tower.training.train import train_epoch
 
 optimizer = torch.optim.AdamW(
     get_param_groups(model, LEARNING_RATE, WEIGHT_DECAY)
@@ -211,23 +221,16 @@ print(f"\nTraining on {device} — {N_EPOCHS} epochs, batch {BATCH_SIZE}, "
 for epoch in range(1, N_EPOCHS + 1):
     print(f"\nEpoch {epoch}/{N_EPOCHS}")
 
-    if USE_HARD_NEGATIVES:
-        epoch_loss = train_epoch_with_hard_negs(
-            model       = model,
-            dataloader  = dataloader,
-            optimizer   = optimizer,
-            temperature = TEMPERATURE,
-            device      = device,
-            log_every   = 100,
-        )
-    else:
-        epoch_loss = train_epoch(
-            model       = model,
-            dataloader  = dataloader,
-            optimizer   = optimizer,
-            device      = device,
-            log_every   = 100,
-        )
+    epoch_loss = train_epoch(
+        model                    = model,
+        dataloader               = dataloader,
+        optimizer                = optimizer,
+        device                   = device,
+        log_every                = 100,
+        use_confidence_weighting = USE_CONFIDENCE_WEIGHTING,
+        log_q_correction_arr     = log_q_arr,
+        label_smoothing          = LABEL_SMOOTHING,
+    )
 
     history["train_loss"].append(epoch_loss)
     current_lr = scheduler.get_last_lr()[0]

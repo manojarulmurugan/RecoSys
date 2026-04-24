@@ -30,32 +30,55 @@ from src.two_tower.models.two_tower import TwoTowerModel
 def in_batch_loss(
     scores: torch.Tensor,
     confidence_weights: torch.Tensor | None = None,
+    log_q_correction: torch.Tensor | None = None,
+    label_smoothing: float = 0.0,
 ) -> torch.Tensor:
-    """In-batch negative cross-entropy loss with optional confidence weighting.
+    """In-batch negative cross-entropy loss with optional confidence weighting,
+    LogQ sampling-bias correction, and label smoothing.
 
     Each row i of `scores` is treated as logits over B classes; the correct
     class is i (the diagonal positive pair).
 
-    When `confidence_weights` is provided, per-sample losses are scaled by
-    normalised confidence so higher-confidence interactions (e.g. purchases)
-    contribute proportionally more gradient than lower-confidence ones
-    (e.g. views). Weights are normalised to mean=1 so overall loss magnitude
-    stays comparable to the unweighted case.
+    **LogQ correction** (YouTube Two-Tower paper, 2019): popular items appear
+    as in-batch negatives more often than rare items, so the model is
+    over-penalised for scoring them highly.  Subtracting ``log(q(item_j))``
+    from column j of the logit matrix removes this frequency bias.  Pass the
+    pre-computed log-frequency values for the B items in the current batch.
+
+    **Confidence weighting**: when provided, per-sample losses are scaled by
+    normalised confidence so purchases contribute more gradient than views.
+    Weights are normalised to mean=1 to keep loss magnitude stable.
+
+    **Label smoothing**: distributes a small amount of probability mass to
+    non-target classes, preventing overconfident predictions.
 
     Args:
         scores:             (B, B) scaled dot-product similarity matrix.
         confidence_weights: (B,) float tensor of raw confidence scores, or
                             None for uniform weighting.
+        log_q_correction:   (B,) float tensor of log(q(item)) for each item
+                            in the batch, where q(item) is its sampling
+                            probability in training data.  Subtracted
+                            column-wise from ``scores`` before cross-entropy.
+                            Pass None to disable (default).
+        label_smoothing:    Label smoothing factor in [0, 1).  0.0 disables.
 
     Returns:
         Scalar loss tensor.
     """
+    if log_q_correction is not None:
+        # Subtract log(q(item_j)) from every column j.
+        # log_q_correction shape: (B,) → unsqueeze to (1, B) for broadcasting.
+        scores = scores - log_q_correction.unsqueeze(0)
+
     labels = torch.arange(scores.size(0), device=scores.device)
 
     if confidence_weights is None:
-        return F.cross_entropy(scores, labels)
+        return F.cross_entropy(scores, labels, label_smoothing=label_smoothing)
 
-    per_sample_loss = F.cross_entropy(scores, labels, reduction="none")
+    per_sample_loss = F.cross_entropy(
+        scores, labels, reduction="none", label_smoothing=label_smoothing
+    )
     norm_weights = confidence_weights / confidence_weights.mean()
     return (per_sample_loss * norm_weights).mean()
 
@@ -108,6 +131,8 @@ def train_epoch(
     device: torch.device,
     log_every: int = 100,
     use_confidence_weighting: bool = False,
+    log_q_correction_arr: np.ndarray | None = None,
+    label_smoothing: float = 0.0,
 ) -> float:
     """Run one full training epoch.
 
@@ -119,6 +144,16 @@ def train_epoch(
         log_every:                Print a progress line every this many batches.
         use_confidence_weighting: If True, weight each pair's loss by its
                                   normalised confidence score.
+        log_q_correction_arr:     Optional float32 numpy array of shape
+                                  (n_items,) holding ``log(q(item))`` for every
+                                  item_idx, where ``q`` is the item's empirical
+                                  sampling frequency in training pairs.  Each
+                                  batch, the values for the current B items are
+                                  looked up and passed to ``in_batch_loss`` as
+                                  the LogQ correction (YouTube Two-Tower, 2019).
+                                  Pass None to disable (default).
+        label_smoothing:          Label smoothing factor forwarded to
+                                  ``in_batch_loss``.  0.0 disables (default).
 
     Returns:
         Mean loss across all batches in the epoch.
@@ -139,12 +174,20 @@ def train_epoch(
 
         _, _, scores = model(user_idx, user_cat, user_dense, item_cat, item_dense)
 
-        # Confidence weighting: disabled by default (neutral on 50k experiments)
-        # Set use_confidence_weighting=True to enable — see reports/05_model_experiments_50k.md
-        if use_confidence_weighting:
-            loss = in_batch_loss(scores, conf)
-        else:
-            loss = in_batch_loss(scores)
+        # LogQ correction: look up log(q(item)) for the B items in this batch
+        log_q: torch.Tensor | None = None
+        if log_q_correction_arr is not None:
+            item_idxs_cpu = batch["item_idx"].numpy()
+            log_q = torch.tensor(
+                log_q_correction_arr[item_idxs_cpu], dtype=torch.float32, device=device
+            )
+
+        loss = in_batch_loss(
+            scores,
+            conf if use_confidence_weighting else None,
+            log_q,
+            label_smoothing,
+        )
 
         loss.backward()
         optimizer.step()
