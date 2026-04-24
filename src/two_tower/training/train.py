@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 from src.two_tower.data.dataset import (
     TwoTowerDataset,
     TwoTowerDatasetWithHardNegs,
+    TwoTowerDatasetWithSeq,
     build_full_item_tensors,
 )
 from src.two_tower.models.two_tower import TwoTowerModel
@@ -270,6 +271,87 @@ def train_epoch_with_hard_negs(
 
         loss = in_batch_loss_with_hard_negs(
             user_embs, pos_item_embs, hard_neg_embs, temperature
+        )
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+        if (batch_idx + 1) % log_every == 0:
+            print(f"  batch {batch_idx + 1}/{total_batches} — loss: {loss.item():.4f}")
+
+    return total_loss / total_batches
+
+
+# ── Sequential Epoch ──────────────────────────────────────────────────────────
+
+def train_epoch_sequential(
+    model: TwoTowerModel,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    log_every: int = 100,
+    use_confidence_weighting: bool = False,
+    log_q_correction_arr: np.ndarray | None = None,
+    label_smoothing: float = 0.0,
+) -> float:
+    """Run one full training epoch for a model with a SequentialUserTower.
+
+    Identical to ``train_epoch`` except it additionally unpacks
+    ``batch['user_seq']`` — a ``(B, seq_len)`` LongTensor of item history
+    indices — and passes it to the model forward as ``user_seq=``.
+
+    The DataLoader must wrap a ``TwoTowerDatasetWithSeq`` instance.
+
+    Args:
+        model:                    TwoTowerModel whose user_tower is a
+                                  SequentialUserTower.
+        dataloader:               DataLoader from TwoTowerDatasetWithSeq.
+        optimizer:                Optimiser (e.g. AdamW).
+        device:                   Target device.
+        log_every:                Print a progress line every this many batches.
+        use_confidence_weighting: Scale per-sample loss by normalised confidence.
+        log_q_correction_arr:     Optional float32 numpy array of shape
+                                  (n_items,) with log(q(item)) for LogQ
+                                  correction (YouTube Two-Tower, 2019).
+        label_smoothing:          Label smoothing factor forwarded to
+                                  ``in_batch_loss``.  0.0 disables (default).
+
+    Returns:
+        Mean loss across all batches in the epoch.
+    """
+    model.train()
+    total_loss    = 0.0
+    total_batches = len(dataloader)
+
+    for batch_idx, batch in enumerate(dataloader):
+        user_idx   = batch["user_idx"].to(device)
+        user_cat   = batch["user_cat"].to(device)
+        user_dense = batch["user_dense"].to(device)
+        user_seq   = batch["user_seq"].to(device)     # (B, seq_len)
+        item_cat   = batch["item_cat"].to(device)
+        item_dense = batch["item_dense"].to(device)
+        conf       = batch["confidence"].to(device)
+
+        optimizer.zero_grad()
+
+        _, _, scores = model(
+            user_idx, user_cat, user_dense, item_cat, item_dense, user_seq=user_seq
+        )
+
+        log_q: torch.Tensor | None = None
+        if log_q_correction_arr is not None:
+            item_idxs_cpu = batch["item_idx"].numpy()
+            log_q = torch.tensor(
+                log_q_correction_arr[item_idxs_cpu], dtype=torch.float32, device=device
+            )
+
+        loss = in_batch_loss(
+            scores,
+            conf if use_confidence_weighting else None,
+            log_q,
+            label_smoothing,
         )
 
         loss.backward()

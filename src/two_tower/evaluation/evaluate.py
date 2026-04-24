@@ -324,6 +324,49 @@ def _print_per_user_diagnostics(
 
 # ── Full Evaluation ───────────────────────────────────────────────────────────
 
+def _build_user_feature_arrays(
+    users_encoded_df: pd.DataFrame,
+    model: "TwoTowerModel",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build user_cat and user_dense numpy lookup arrays for all eval users.
+
+    Auto-detects whether the model uses V2 user features (no dow_emb) and
+    includes sin/cos DOW in the dense vector accordingly.
+
+    Returns:
+        user_cat_arr:   int64 array (n_users, 4)
+        user_dense_arr: float32 array (n_users, 6) or (n_users, 8)
+    """
+    n_users = int(users_encoded_df["user_idx"].max()) + 1
+
+    user_cat_arr = np.zeros((n_users, 4), dtype=np.int64)
+    user_cat_arr[users_encoded_df["user_idx"].values] = users_encoded_df[
+        ["top_cat_idx", "peak_hour_bucket", "preferred_dow", "has_purchase_history"]
+    ].values.astype(np.int64)
+
+    # V2 user tower: no dow_emb → sin/cos DOW appended to dense (8-dim)
+    # V1/V3 user tower: has dow_emb → dense stays 6-dim
+    use_v2_user = not hasattr(model.user_tower, "dow_emb")
+
+    base_dense = users_encoded_df[
+        ["log_total_events", "months_active", "purchase_rate", "cart_rate",
+         "log_n_sessions", "avg_purchase_price_scaled"]
+    ].values.astype(np.float32)
+
+    if use_v2_user:
+        dow_vals = users_encoded_df["preferred_dow"].values.astype(np.float32)
+        sin_dow  = np.sin(2.0 * np.pi * dow_vals / 7.0).reshape(-1, 1)
+        cos_dow  = np.cos(2.0 * np.pi * dow_vals / 7.0).reshape(-1, 1)
+        dense_to_assign = np.hstack([base_dense, sin_dow, cos_dow])
+        user_dense_arr = np.zeros((n_users, 8), dtype=np.float32)
+    else:
+        dense_to_assign = base_dense
+        user_dense_arr = np.zeros((n_users, 6), dtype=np.float32)
+
+    user_dense_arr[users_encoded_df["user_idx"].values] = dense_to_assign
+    return user_cat_arr, user_dense_arr
+
+
 def evaluate(
     model: TwoTowerModel,
     items_encoded_df: pd.DataFrame,
@@ -335,6 +378,7 @@ def evaluate(
     batch_size: int = 512,
     n_faiss_candidates: int = 100,
     trained_item_idxs: set | np.ndarray | None = None,
+    user_seq_arr: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """End-to-end retrieval evaluation using FAISS nearest-neighbour search.
 
@@ -402,18 +446,8 @@ def evaluate(
     seen_items = build_seen_items(train_pairs_df)
 
     # ── Step 4: User feature lookup arrays ────────────────────────────────────
-    n_users = int(users_encoded_df["user_idx"].max()) + 1
-
-    user_cat_arr = np.zeros((n_users, 4), dtype=np.int64)
-    user_cat_arr[users_encoded_df["user_idx"].values] = users_encoded_df[
-        ["top_cat_idx", "peak_hour_bucket", "preferred_dow", "has_purchase_history"]
-    ].values.astype(np.int64)
-
-    user_dense_arr = np.zeros((n_users, 6), dtype=np.float32)
-    user_dense_arr[users_encoded_df["user_idx"].values] = users_encoded_df[
-        ["log_total_events", "months_active", "purchase_rate", "cart_rate",
-         "log_n_sessions", "avg_purchase_price_scaled"]
-    ].values.astype(np.float32)
+    user_cat_arr, user_dense_arr = _build_user_feature_arrays(users_encoded_df, model)
+    n_users = user_cat_arr.shape[0]
 
     # Safety check: no eval user should fall outside the feature matrix
     if eval_users:
@@ -447,7 +481,15 @@ def evaluate(
                 user_dense_arr[batch_user_idxs], dtype=torch.float32, device=device
             )
 
-            user_embs = model.get_user_embedding(uid_tensor, cat_tensor, dense_tensor)
+            seq_tensor: torch.Tensor | None = None
+            if user_seq_arr is not None:
+                seq_tensor = torch.tensor(
+                    user_seq_arr[batch_user_idxs], dtype=torch.long, device=device
+                )
+
+            user_embs = model.get_user_embedding(
+                uid_tensor, cat_tensor, dense_tensor, user_seq=seq_tensor
+            )
             user_embs_np = user_embs.cpu().numpy().astype(np.float32)
             faiss.normalize_L2(user_embs_np)
 
@@ -531,6 +573,7 @@ def evaluate_stratified(
     batch_size: int = 512,
     n_faiss_candidates: int = 100,
     trained_item_idxs: set | np.ndarray | None = None,
+    user_seq_arr: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """End-to-end retrieval evaluation broken down by training-interaction cohort.
 
@@ -623,18 +666,7 @@ def evaluate_stratified(
     seen_items = build_seen_items(train_pairs_df)
 
     # ── Step 4: User feature lookup arrays ────────────────────────────────────
-    n_users = int(users_encoded_df["user_idx"].max()) + 1
-
-    user_cat_arr = np.zeros((n_users, 4), dtype=np.int64)
-    user_cat_arr[users_encoded_df["user_idx"].values] = users_encoded_df[
-        ["top_cat_idx", "peak_hour_bucket", "preferred_dow", "has_purchase_history"]
-    ].values.astype(np.int64)
-
-    user_dense_arr = np.zeros((n_users, 6), dtype=np.float32)
-    user_dense_arr[users_encoded_df["user_idx"].values] = users_encoded_df[
-        ["log_total_events", "months_active", "purchase_rate", "cart_rate",
-         "log_n_sessions", "avg_purchase_price_scaled"]
-    ].values.astype(np.float32)
+    user_cat_arr, user_dense_arr = _build_user_feature_arrays(users_encoded_df, model)
 
     # ── Step 5: Inference — single pass over all eval users ───────────────────
     idx2item: dict[int, int] = vocabs["idx2item"]
@@ -659,7 +691,15 @@ def evaluate_stratified(
                 user_dense_arr[batch_user_idxs], dtype=torch.float32, device=device
             )
 
-            user_embs    = model.get_user_embedding(uid_tensor, cat_tensor, dense_tensor)
+            seq_tensor: torch.Tensor | None = None
+            if user_seq_arr is not None:
+                seq_tensor = torch.tensor(
+                    user_seq_arr[batch_user_idxs], dtype=torch.long, device=device
+                )
+
+            user_embs    = model.get_user_embedding(
+                uid_tensor, cat_tensor, dense_tensor, user_seq=seq_tensor
+            )
             user_embs_np = user_embs.cpu().numpy().astype(np.float32)
             faiss.normalize_L2(user_embs_np)
 

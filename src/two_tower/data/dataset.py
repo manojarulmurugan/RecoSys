@@ -20,11 +20,22 @@ class TwoTowerDataset(Dataset):
     """Maps (user_idx, item_idx, confidence_score) training pairs to
     feature tensors via O(1) numpy array lookups.
 
+    Auto-detects V2 features:
+      - If ``items_encoded_df`` contains ``price_relative_to_cat_avg_scaled``
+        and ``product_recency_log_scaled``, those are included as the 4th and
+        5th elements of ``item_dense`` (dim becomes 5 instead of 3).
+      - ``user_dense`` always includes sin/cos DOW computed from
+        ``preferred_dow``, making it 8-dim instead of 6.
+
     Args:
         train_pairs_df:    DataFrame with columns [user_idx, item_idx, confidence_score].
         users_encoded_df:  DataFrame produced by FeatureBuilder.build() for users.
         items_encoded_df:  DataFrame produced by FeatureBuilder.build() for items.
+                           Pass ``items_encoded_v2.parquet`` to enable V2 item features.
     """
+
+    # V2 item dense columns (in addition to the original 3)
+    _V2_ITEM_DENSE_COLS = ["price_relative_to_cat_avg_scaled", "product_recency_log_scaled"]
 
     def __init__(
         self,
@@ -35,7 +46,6 @@ class TwoTowerDataset(Dataset):
         self.pairs = train_pairs_df.reset_index(drop=True)
 
         # ── User feature lookups keyed by user_idx ────────────────────────────
-        # Allocate arrays large enough to hold the highest user_idx.
         n_users = int(users_encoded_df["user_idx"].max()) + 1
 
         # int64: [top_cat_idx, peak_hour_bucket, preferred_dow, has_purchase_history]
@@ -44,13 +54,21 @@ class TwoTowerDataset(Dataset):
             ["top_cat_idx", "peak_hour_bucket", "preferred_dow", "has_purchase_history"]
         ].values.astype(np.int64)
 
-        # float32: [log_total_events, months_active, purchase_rate, cart_rate,
-        #           log_n_sessions, avg_purchase_price_scaled]
-        user_dense_arr = np.zeros((n_users, 6), dtype=np.float32)
-        user_dense_arr[users_encoded_df["user_idx"].values] = users_encoded_df[
+        # float32: 6 original + sin_dow + cos_dow = 8 dims
+        # sin/cos DOW encodes the cyclic nature of day-of-week better than an integer embedding.
+        dow_vals = users_encoded_df["preferred_dow"].values.astype(np.float32)
+        sin_dow  = np.sin(2.0 * np.pi * dow_vals / 7.0).reshape(-1, 1)
+        cos_dow  = np.cos(2.0 * np.pi * dow_vals / 7.0).reshape(-1, 1)
+
+        base_dense = users_encoded_df[
             ["log_total_events", "months_active", "purchase_rate", "cart_rate",
              "log_n_sessions", "avg_purchase_price_scaled"]
         ].values.astype(np.float32)
+
+        user_dense_arr = np.zeros((n_users, 8), dtype=np.float32)
+        user_dense_arr[users_encoded_df["user_idx"].values] = np.hstack(
+            [base_dense, sin_dow, cos_dow]
+        )
 
         self._user_cat   = user_cat_arr
         self._user_dense = user_dense_arr
@@ -64,14 +82,23 @@ class TwoTowerDataset(Dataset):
             ["item_idx", "cat_l1_idx", "cat_l2_idx", "brand_idx", "price_bucket"]
         ].values.astype(np.int64)
 
-        # float32: [avg_price_scaled, log_confidence_scaled, purchase_rate_scaled]
-        item_dense_arr = np.zeros((n_items, 3), dtype=np.float32)
+        # float32: 3 original + 2 V2 if present
+        base_dense_cols = ["avg_price_scaled", "log_confidence_scaled", "purchase_rate_scaled"]
+        v2_cols_present = all(c in items_encoded_df.columns for c in self._V2_ITEM_DENSE_COLS)
+        if v2_cols_present:
+            dense_cols = base_dense_cols + list(self._V2_ITEM_DENSE_COLS)
+        else:
+            dense_cols = base_dense_cols
+
+        n_item_dense = len(dense_cols)
+        item_dense_arr = np.zeros((n_items, n_item_dense), dtype=np.float32)
         item_dense_arr[items_encoded_df["item_idx"].values] = items_encoded_df[
-            ["avg_price_scaled", "log_confidence_scaled", "purchase_rate_scaled"]
+            dense_cols
         ].values.astype(np.float32)
 
-        self._item_cat   = item_cat_arr
-        self._item_dense = item_dense_arr
+        self._item_cat        = item_cat_arr
+        self._item_dense      = item_dense_arr
+        self._use_v2_items    = v2_cols_present
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -540,30 +567,97 @@ class TwoTowerDatasetWithHardNegs(Dataset):
         return "TwoTowerDatasetWithHardNegs(" + ", ".join(parts) + ")"
 
 
+class TwoTowerDatasetWithSeq(TwoTowerDataset):
+    """TwoTowerDataset extended with a pre-computed user item-history sequence.
+
+    For each user, the last ``seq_len`` item indices from ``train_pairs_df``
+    are stored in ``_user_seq`` (shape ``(n_users, seq_len)``).  Row order in
+    ``train_pairs_df`` is assumed to follow interaction time (the FeatureBuilder
+    preserves the temporal ordering of the source interaction log).  Items are
+    left-padded with 0 for users whose history is shorter than ``seq_len``.
+
+    The extra ``user_seq`` key in each batch feeds ``SequentialUserTower``.
+
+    Args:
+        train_pairs_df:   Same as TwoTowerDataset.
+        users_encoded_df: Same as TwoTowerDataset.
+        items_encoded_df: Same as TwoTowerDataset (V2 parquet recommended).
+        seq_len:          History window length.  Default 20 matches the
+                          SequentialUserTower default.
+    """
+
+    def __init__(
+        self,
+        train_pairs_df: pd.DataFrame,
+        users_encoded_df: pd.DataFrame,
+        items_encoded_df: pd.DataFrame,
+        seq_len: int = 20,
+    ) -> None:
+        super().__init__(train_pairs_df, users_encoded_df, items_encoded_df)
+
+        n_users = self._user_dense.shape[0]
+        user_seq_arr = np.zeros((n_users, seq_len), dtype=np.int64)
+
+        print(f"  Building user item sequences (seq_len={seq_len})...")
+        n_processed = 0
+        for uid, grp in train_pairs_df.groupby("user_idx", sort=False)["item_idx"]:
+            uid_int = int(uid)
+            if uid_int >= n_users:
+                continue
+            items = grp.values.astype(np.int64)
+            if len(items) >= seq_len:
+                user_seq_arr[uid_int] = items[-seq_len:]
+            else:
+                user_seq_arr[uid_int, seq_len - len(items):] = items
+            n_processed += 1
+            if n_processed % 100_000 == 0:
+                print(f"    {n_processed:,} users processed...")
+
+        self._user_seq = user_seq_arr
+        print(f"  User sequences ready: {n_users:,} users, {seq_len} items each.")
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        base = super().__getitem__(idx)
+        user_idx = int(base["user_idx"])
+        base["user_seq"] = torch.tensor(self._user_seq[user_idx], dtype=torch.long)
+        return base
+
+
 def build_full_item_tensors(
     items_encoded_df: pd.DataFrame,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build dense tensors over ALL items for FAISS index construction at inference time.
 
     Items are sorted by item_idx ascending so that tensor row i corresponds to item_idx i.
+    Auto-detects V2 item features: if ``price_relative_to_cat_avg_scaled`` and
+    ``product_recency_log_scaled`` are present in ``items_encoded_df``, they are
+    appended to item_dense (making it 5-dim instead of 3).
 
     Args:
-        items_encoded_df: DataFrame produced by FeatureBuilder.build() for items.
+        items_encoded_df: DataFrame produced by FeatureBuilder.build() for items,
+                          or the V2 augmented version with extra dense columns.
 
     Returns:
         item_cat_tensor:   LongTensor of shape (n_items, 5)
                            columns: [item_idx, cat_l1_idx, cat_l2_idx, brand_idx, price_bucket]
-        item_dense_tensor: FloatTensor of shape (n_items, 3)
-                           columns: [avg_price_scaled, log_confidence_scaled, purchase_rate_scaled]
+        item_dense_tensor: FloatTensor of shape (n_items, 3 or 5)
+                           columns: [avg_price_scaled, log_confidence_scaled, purchase_rate_scaled,
+                                     (price_relative_to_cat_avg_scaled, product_recency_log_scaled)]
     """
+    _V2_COLS = ["price_relative_to_cat_avg_scaled", "product_recency_log_scaled"]
     df = items_encoded_df.sort_values("item_idx").reset_index(drop=True)
 
     item_cat_tensor = torch.tensor(
         df[["item_idx", "cat_l1_idx", "cat_l2_idx", "brand_idx", "price_bucket"]].values,
         dtype=torch.long,
     )
+
+    dense_cols = ["avg_price_scaled", "log_confidence_scaled", "purchase_rate_scaled"]
+    if all(c in df.columns for c in _V2_COLS):
+        dense_cols = dense_cols + _V2_COLS
+
     item_dense_tensor = torch.tensor(
-        df[["avg_price_scaled", "log_confidence_scaled", "purchase_rate_scaled"]].values,
+        df[dense_cols].values,
         dtype=torch.float32,
     )
     return item_cat_tensor, item_dense_tensor
