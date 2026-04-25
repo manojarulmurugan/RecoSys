@@ -102,21 +102,25 @@ print(f"  min={price_rel_scaled.min():.3f}  max={price_rel_scaled.max():.3f}"
 # Items seen later in the dataset (e.g. new products) get lower recency values.
 
 print("\nLoading interactions from GCS (for first-seen timestamps)...")
+# The aggregated interactions parquet has first_interaction / last_interaction
+# per (user_id, product_id) pair rather than individual event_time rows.
+# We take the minimum first_interaction per product_id as its catalog debut date.
 interactions = pd.read_parquet(
     INTERACTIONS_GCS,
-    columns=["product_id", "event_time"],
+    columns=["product_id", "first_interaction"],
 )
 print(f"  shape: {interactions.shape}")
+print(f"  columns: {list(interactions.columns)}")
 
 print("Computing product_recency_log...")
-interactions["event_time"] = pd.to_datetime(interactions["event_time"], utc=True)
+interactions["first_interaction"] = pd.to_datetime(interactions["first_interaction"], utc=True)
 cutoff_utc = pd.Timestamp(TRAINING_END_DATE, tz="UTC")
 
 first_seen = (
-    interactions.groupby("product_id")["event_time"]
+    interactions.groupby("product_id")["first_interaction"]
     .min()
     .reset_index()
-    .rename(columns={"event_time": "first_seen"})
+    .rename(columns={"first_interaction": "first_seen"})
 )
 first_seen["days_to_cutoff"] = (
     (cutoff_utc - first_seen["first_seen"]).dt.total_seconds() / 86400.0

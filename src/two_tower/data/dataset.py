@@ -37,6 +37,10 @@ class TwoTowerDataset(Dataset):
     # V2 item dense columns (in addition to the original 3)
     _V2_ITEM_DENSE_COLS = ["price_relative_to_cat_avg_scaled", "product_recency_log_scaled"]
 
+    # V3 user dense columns — item centroid (in addition to the 8 V2 dims)
+    _CENTROID_DIM: int = 32
+    _CENTROID_COLS = [f"item_centroid_{i}" for i in range(_CENTROID_DIM)]
+
     def __init__(
         self,
         train_pairs_df: pd.DataFrame,
@@ -54,8 +58,8 @@ class TwoTowerDataset(Dataset):
             ["top_cat_idx", "peak_hour_bucket", "preferred_dow", "has_purchase_history"]
         ].values.astype(np.int64)
 
-        # float32: 6 original + sin_dow + cos_dow = 8 dims
-        # sin/cos DOW encodes the cyclic nature of day-of-week better than an integer embedding.
+        # float32: 6 original + sin_dow + cos_dow = 8 dims (V2)
+        # If item_centroid_* columns are present (V3 users), append 32 more → 40 dims.
         dow_vals = users_encoded_df["preferred_dow"].values.astype(np.float32)
         sin_dow  = np.sin(2.0 * np.pi * dow_vals / 7.0).reshape(-1, 1)
         cos_dow  = np.cos(2.0 * np.pi * dow_vals / 7.0).reshape(-1, 1)
@@ -65,13 +69,20 @@ class TwoTowerDataset(Dataset):
              "log_n_sessions", "avg_purchase_price_scaled"]
         ].values.astype(np.float32)
 
-        user_dense_arr = np.zeros((n_users, 8), dtype=np.float32)
-        user_dense_arr[users_encoded_df["user_idx"].values] = np.hstack(
-            [base_dense, sin_dow, cos_dow]
-        )
+        use_centroid = all(c in users_encoded_df.columns for c in self._CENTROID_COLS)
+        if use_centroid:
+            centroid = users_encoded_df[self._CENTROID_COLS].values.astype(np.float32)
+            dense_data = np.hstack([base_dense, sin_dow, cos_dow, centroid])  # (n, 40)
+        else:
+            dense_data = np.hstack([base_dense, sin_dow, cos_dow])            # (n, 8)
 
-        self._user_cat   = user_cat_arr
-        self._user_dense = user_dense_arr
+        n_user_dense = dense_data.shape[1]
+        user_dense_arr = np.zeros((n_users, n_user_dense), dtype=np.float32)
+        user_dense_arr[users_encoded_df["user_idx"].values] = dense_data
+
+        self._user_cat      = user_cat_arr
+        self._user_dense    = user_dense_arr
+        self._use_centroid  = use_centroid
 
         # ── Item feature lookups keyed by item_idx ────────────────────────────
         n_items = int(items_encoded_df["item_idx"].max()) + 1

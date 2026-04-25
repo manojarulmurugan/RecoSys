@@ -19,6 +19,16 @@ V3 / V5 addition:
   - SequentialUserTower: encodes the user's last-N interacted items with a
     GRU and concatenates the hidden state with static dense features.
     item_seq_emb weights are tied to ItemTower.item_emb after construction.
+
+V6 addition:
+  - UserTowerV3: extends UserTowerV2 by appending a pre-computed 32-dim
+    item-centroid vector (mean of item_emb over the user's high-intent
+    history) to the dense vector (dense_input_dim 8 → 40).
+    MLP input: 32 + 16 + 8 + 40 + 1 = 97.
+    Users with no high-intent history receive a zero centroid and fall
+    back gracefully to their static features.
+    Run scripts/two_tower/build_users_v2_500k.py to build the centroid
+    columns before training.
 """
 
 import torch
@@ -461,6 +471,93 @@ class SequentialUserTower(nn.Module):
         return F.normalize(x, dim=1)
 
 
+# ── User Tower V3 (sin/cos DOW + 32-dim item centroid) ────────────────────────
+
+class UserTowerV3(nn.Module):
+    """V3 user tower: UserTowerV2 + a pre-computed 32-dim item-centroid feature.
+
+    The centroid is the mean of ``item_tower.item_emb`` vectors over the user's
+    cart+purchase history, computed offline by
+    ``scripts/two_tower/build_users_v2_500k.py`` and stored as
+    ``item_centroid_0 .. item_centroid_31`` in ``users_encoded_v2.parquet``.
+
+    Categorical inputs (embedded):
+      user_idx, top_cat_idx, peak_hour_bucket
+
+    Dense inputs (40-dim):
+      [0:6]   log_total_events, months_active, purchase_rate, cart_rate,
+              log_n_sessions, avg_purchase_price_scaled
+      [6:8]   sin(2π·preferred_dow/7),  cos(2π·preferred_dow/7)
+      [8:40]  item_centroid_0 .. item_centroid_31  (zero if no high-intent history)
+
+    Scalar appended separately:
+      has_purchase_history  (0/1 → float)
+
+    MLP input dim: embed_dim_user + embed_dim_cat + embed_dim_small
+                   + dense_input_dim + 1
+                 = 32 + 16 + 8 + 40 + 1 = 97  (with defaults)
+    """
+
+    CENTROID_DIM: int = 32   # must match item_tower.item_emb embed_dim (32)
+
+    def __init__(
+        self,
+        n_users: int,
+        n_top_cats: int,
+        n_hour_buckets: int = 4,
+        embed_dim_user: int = 32,
+        embed_dim_cat: int = 16,
+        embed_dim_small: int = 8,
+        dense_input_dim: int = 40,   # 8 (V2) + 32 (centroid)
+        hidden_dim: int = 256,
+        output_dim: int = 64,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        self.user_emb    = nn.Embedding(n_users,        embed_dim_user)
+        self.top_cat_emb = nn.Embedding(n_top_cats,     embed_dim_cat)
+        self.hour_emb    = nn.Embedding(n_hour_buckets, embed_dim_small)
+
+        mlp_input_dim = (
+            embed_dim_user + embed_dim_cat + embed_dim_small
+            + dense_input_dim + 1   # +1 for has_purchase_history scalar
+        )
+
+        self.mlp = nn.Sequential(
+            nn.Linear(mlp_input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for emb in (self.user_emb, self.top_cat_emb, self.hour_emb):
+            _init_embedding(emb)
+        for module in self.mlp:
+            if isinstance(module, nn.Linear):
+                _init_linear(module)
+
+    def forward(
+        self,
+        user_idx: torch.Tensor,   # (B,)
+        user_cat: torch.Tensor,   # (B, 4) — [top_cat_idx, hour_bucket, preferred_dow, has_purchase]
+        user_dense: torch.Tensor, # (B, 40) — 8 V2 features + 32-dim centroid
+        user_seq: torch.Tensor | None = None,  # ignored; accepted for API compat
+    ) -> torch.Tensor:            # (B, output_dim)
+        e_user    = self.user_emb(user_idx)           # (B, 32)
+        e_top_cat = self.top_cat_emb(user_cat[:, 0])  # (B, 16)
+        e_hour    = self.hour_emb(user_cat[:, 1])     # (B, 8)
+        has_purch = user_cat[:, 3:4].float()          # (B, 1)
+
+        x = torch.cat([e_user, e_top_cat, e_hour, user_dense, has_purch], dim=1)
+        x = self.mlp(x)
+        return F.normalize(x, dim=1)
+
+
 # ── Two-Tower Model ───────────────────────────────────────────────────────────
 
 class TwoTowerModel(nn.Module):
@@ -479,7 +576,7 @@ class TwoTowerModel(nn.Module):
 
     def __init__(
         self,
-        user_tower: "UserTower | UserTowerV2 | SequentialUserTower",
+        user_tower: "UserTower | UserTowerV2 | UserTowerV3 | SequentialUserTower",
         item_tower: "ItemTower | ItemTowerV2",
         temperature: float = 0.07,
     ) -> None:

@@ -324,18 +324,26 @@ def _print_per_user_diagnostics(
 
 # ── Full Evaluation ───────────────────────────────────────────────────────────
 
+_CENTROID_DIM  = 32
+_CENTROID_COLS = [f"item_centroid_{i}" for i in range(_CENTROID_DIM)]
+
+
 def _build_user_feature_arrays(
     users_encoded_df: pd.DataFrame,
     model: "TwoTowerModel",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build user_cat and user_dense numpy lookup arrays for all eval users.
 
-    Auto-detects whether the model uses V2 user features (no dow_emb) and
-    includes sin/cos DOW in the dense vector accordingly.
+    Auto-detects the user tower variant and adjusts the dense vector:
+      - V1 UserTower (has dow_emb):        dense 6-dim
+      - V2 UserTowerV2 / SequentialUserTower (no dow_emb, no centroid cols):
+                                            dense 8-dim (+ sin/cos DOW)
+      - V3 UserTowerV3 (no dow_emb, centroid cols present in df):
+                                            dense 40-dim (8 + 32 centroid)
 
     Returns:
         user_cat_arr:   int64 array (n_users, 4)
-        user_dense_arr: float32 array (n_users, 6) or (n_users, 8)
+        user_dense_arr: float32 array (n_users, 6 | 8 | 40)
     """
     n_users = int(users_encoded_df["user_idx"].max()) + 1
 
@@ -344,24 +352,36 @@ def _build_user_feature_arrays(
         ["top_cat_idx", "peak_hour_bucket", "preferred_dow", "has_purchase_history"]
     ].values.astype(np.int64)
 
-    # V2 user tower: no dow_emb → sin/cos DOW appended to dense (8-dim)
-    # V1/V3 user tower: has dow_emb → dense stays 6-dim
-    use_v2_user = not hasattr(model.user_tower, "dow_emb")
-
     base_dense = users_encoded_df[
         ["log_total_events", "months_active", "purchase_rate", "cart_rate",
          "log_n_sessions", "avg_purchase_price_scaled"]
     ].values.astype(np.float32)
 
-    if use_v2_user:
+    use_v2_user = not hasattr(model.user_tower, "dow_emb")
+    use_centroid = (
+        use_v2_user
+        and all(c in users_encoded_df.columns for c in _CENTROID_COLS)
+    )
+
+    if use_centroid:
+        # V3: 8-dim V2 features + 32-dim item centroid
+        dow_vals = users_encoded_df["preferred_dow"].values.astype(np.float32)
+        sin_dow  = np.sin(2.0 * np.pi * dow_vals / 7.0).reshape(-1, 1)
+        cos_dow  = np.cos(2.0 * np.pi * dow_vals / 7.0).reshape(-1, 1)
+        centroid = users_encoded_df[_CENTROID_COLS].values.astype(np.float32)
+        dense_to_assign = np.hstack([base_dense, sin_dow, cos_dow, centroid])
+        user_dense_arr  = np.zeros((n_users, 40), dtype=np.float32)
+    elif use_v2_user:
+        # V2: sin/cos DOW in dense (8-dim)
         dow_vals = users_encoded_df["preferred_dow"].values.astype(np.float32)
         sin_dow  = np.sin(2.0 * np.pi * dow_vals / 7.0).reshape(-1, 1)
         cos_dow  = np.cos(2.0 * np.pi * dow_vals / 7.0).reshape(-1, 1)
         dense_to_assign = np.hstack([base_dense, sin_dow, cos_dow])
-        user_dense_arr = np.zeros((n_users, 8), dtype=np.float32)
+        user_dense_arr  = np.zeros((n_users, 8), dtype=np.float32)
     else:
+        # V1: plain 6-dim dense
         dense_to_assign = base_dense
-        user_dense_arr = np.zeros((n_users, 6), dtype=np.float32)
+        user_dense_arr  = np.zeros((n_users, 6), dtype=np.float32)
 
     user_dense_arr[users_encoded_df["user_idx"].values] = dense_to_assign
     return user_cat_arr, user_dense_arr
