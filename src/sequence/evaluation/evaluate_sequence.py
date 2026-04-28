@@ -1,26 +1,34 @@
 """FAISS-based evaluation for sequence models (V7 / V8).
 
-The two-tower evaluator (``src.two_tower.evaluation.evaluate``) is tightly
-coupled to the static user-feature pipeline (FeatureBuilder centroids,
-multi-feature user/item dense vectors).  Sequence models have a much simpler
-inference path:
+Key design difference from the two-tower evaluator:
+─────────────────────────────────────────────────────────────────────────────
+Sequential recommendation solves *next-item prediction*, not *novel item
+discovery*.  The two-tower pipeline filters every item the user touched in
+training (train_pairs_df) out of the recommendation list.  This is correct
+for Feb test evaluation (items seen in Oct–Jan 24 vs Feb purchases — good
+temporal gap) but **kills the validation signal for the Jan 25–31 window**:
+a user who carts something on Jan 27 almost certainly viewed/carted it
+before Jan 25 → it is in train_pairs → it is filtered from recs →
+ground-truth items can never appear → Recall = 0.0000 no matter how good
+the model is.
 
-    item_emb_table  = model.get_item_embeddings()          # FAISS payload
-    user_emb_batch  = model.encode_sequence(item_batch, evt_batch)  # last-pos
+The fix: ``filter_seen: bool`` parameter.
+  - ``filter_seen=False``  (default for validation runs)
+    No filtering.  Measures raw next-item prediction quality.
+    Use this for the periodic val eval (Jan 25-31).
+  - ``filter_seen=True``   (use for the final Feb test eval)
+    Mirrors the V1–V6 two-tower protocol so numbers are comparable.
+    For the Feb window the overlap between training history and ground
+    truth is lower (5+ week gap) so some hits survive the filter.
 
-This module is the dedicated entry point for that flow.  It reuses
-``build_seen_items`` from the two-tower evaluator (identical logic) and
-inlines the metric helpers so both eval pipelines stay independent.
+Both public functions expose a ``filter_seen`` parameter.  The train scripts
+set it explicitly for each call so the log is unambiguous.
+─────────────────────────────────────────────────────────────────────────────
 
 Two public functions:
 
-    ``evaluate_sequence(...)``           — overall Recall@10/20, NDCG@10/20.
-    ``evaluate_sequence_stratified(...)`` — same metrics broken down by
-        Cold (3-10), Medium (11-50), Warm (51+) training-interaction cohorts.
-
-Both accept eval targets in ``user_idx, item_idx`` form so the same
-function works for the validation slice (``val_targets.parquet``) and for
-the final test slice (``test_pairs.parquet``).
+    ``evaluate_sequence(...)``            — overall Recall@10/20, NDCG@10/20.
+    ``evaluate_sequence_stratified(...)`` — same + Cold/Med/Warm cohorts.
 """
 
 from __future__ import annotations
@@ -74,11 +82,7 @@ def _ndcg_at_k(predicted: list, ground_truth: set, k: int) -> float:
 def _build_ground_truth_idx(
     targets_df: pd.DataFrame,
 ) -> dict[int, set]:
-    """user_idx → set of item_idx for cart + purchase rows.
-
-    Filters to event_type ∈ {cart, purchase} when the column is present
-    (val_targets and the upstream test pairs both keep this column).
-    """
+    """user_idx → set of item_idx for cart + purchase rows."""
     if "user_idx" not in targets_df.columns or "item_idx" not in targets_df.columns:
         raise ValueError(
             "targets_df must have user_idx and item_idx columns; "
@@ -95,20 +99,55 @@ def _build_ground_truth_idx(
     return gt
 
 
+# ── Seen-item filter diagnostic ───────────────────────────────────────────────
+
+def _print_filter_diagnostic(
+    ground_truth: dict[int, set],
+    seen_items:   dict[int, set],
+    eval_users:   list[int],
+    label:        str,
+) -> None:
+    """Show what fraction of GT items would be hidden by the seen-item filter.
+
+    If this number is close to 100% for the val split (Jan 25–31) it means
+    the filter would make Recall impossible — users re-interacted with the
+    same items in the val window that they already had in training.
+    """
+    total_gt  = 0
+    total_hit = 0
+    for u in eval_users:
+        gt   = ground_truth.get(u, set())
+        seen = seen_items.get(u, set())
+        total_gt  += len(gt)
+        total_hit += len(gt & seen)
+    pct = 100.0 * total_hit / max(total_gt, 1)
+    print(
+        f"  [filter diag | {label}] "
+        f"{total_hit:,}/{total_gt:,} GT items are in seen_items ({pct:.1f}%) "
+        f"— these would be invisible if filter_seen=True"
+    )
+    if pct > 80:
+        print(
+            f"  ⚠  > 80 % of GT items are filtered. Using filter_seen=True "
+            f"for this eval window would produce near-zero recall even with a "
+            f"perfect model.  Use filter_seen=False for this window."
+        )
+
+
 # ── FAISS index from item-embedding table ─────────────────────────────────────
 
 def _build_item_faiss_index(
-    model: SequenceModel,
-    n_items: int,
+    model:             SequenceModel,
+    n_items:           int,
     trained_item_idxs: set | np.ndarray | None,
-    device: torch.device,
+    device:            torch.device,
 ) -> tuple[np.ndarray, np.ndarray, faiss.Index]:
-    """Materialise item embeddings, restrict to trained items, build FAISS IP index.
+    """Build a FAISS IndexFlatIP over trained item embeddings.
 
     Returns:
         embeddings:      (n_indexed, D) float32, L2-normalised.
-        item_idx_array:  (n_indexed,)   int64, item_idx per row of embeddings.
-        index:           Built FAISS index ready for ``index.search``.
+        item_idx_array:  (n_indexed,)   int64 — item_idx per row.
+        index:           Ready FAISS index.
     """
     model.eval()
     with torch.no_grad():
@@ -120,7 +159,6 @@ def _build_item_faiss_index(
         )
 
     if trained_item_idxs is None:
-        # Index every non-PAD item.
         keep_mask = np.ones(n_items, dtype=bool)
         keep_mask[0] = False  # never index PAD
     else:
@@ -143,7 +181,7 @@ def _build_item_faiss_index(
     return embeddings, item_idx_array, index
 
 
-# ── Per-user retrieval (single pass, returns aligned arrays) ──────────────────
+# ── Per-user retrieval ────────────────────────────────────────────────────────
 
 def _retrieve_recommendations(
     model:               SequenceModel,
@@ -156,16 +194,19 @@ def _retrieve_recommendations(
     device:              torch.device,
     batch_size:          int,
     n_faiss_candidates:  int,
-) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
-    """Encode users and run FAISS search; return per-user filtered top lists.
+    filter_seen:         bool,
+) -> dict[int, list[int]]:
+    """Encode users, run FAISS, and return per-user top-20 item_idx lists.
+
+    When ``filter_seen=False``, ``seen_items`` is not consulted and the
+    raw FAISS result (top-20 by score) is returned.
+    When ``filter_seen=True``, items whose item_idx ∈ ``seen_items[u]``
+    are removed before capping at 20.
 
     Returns:
-        recs_idx_by_user: user_idx → list of item_idx (top-20 after filtering).
-        candidates_by_user: user_idx → full unfiltered list of item_idx
-            returned by FAISS (used by callers needing the raw retrieval set).
+        recs_idx_by_user: user_idx → list[item_idx], length ≤ 20.
     """
-    recs_idx_by_user:    dict[int, list[int]] = {}
-    candidates_by_user:  dict[int, list[int]] = {}
+    recs_idx_by_user: dict[int, list[int]] = {}
 
     model.eval()
     with torch.no_grad():
@@ -187,22 +228,26 @@ def _retrieve_recommendations(
 
             for i, u in enumerate(batch_user_idxs):
                 positions = faiss_indices[i]
-                user_seen = seen_items.get(u, set())
 
-                kept: list[int] = []
-                raw:  list[int] = []
-                for pos in positions:
-                    if pos < 0:
-                        continue
-                    iidx = int(item_idx_array[pos])
-                    raw.append(iidx)
-                    if iidx in user_seen:
-                        continue
-                    kept.append(iidx)
+                if filter_seen:
+                    user_seen = seen_items.get(u, set())
+                    kept: list[int] = []
+                    for pos in positions:
+                        if pos < 0:
+                            continue
+                        iidx = int(item_idx_array[pos])
+                        if iidx not in user_seen:
+                            kept.append(iidx)
+                    recs_idx_by_user[u] = kept[:20]
+                else:
+                    raw: list[int] = [
+                        int(item_idx_array[pos])
+                        for pos in positions
+                        if pos >= 0
+                    ]
+                    recs_idx_by_user[u] = raw[:20]
 
-                recs_idx_by_user [u] = kept[:20]
-                candidates_by_user[u] = raw
-    return recs_idx_by_user, candidates_by_user
+    return recs_idx_by_user
 
 
 # ── Main: overall evaluation ──────────────────────────────────────────────────
@@ -219,39 +264,42 @@ def evaluate_sequence(
     n_faiss_candidates:  int = 100,
     trained_item_idxs:   set | np.ndarray | None = None,
     label:               str = "eval",
+    filter_seen:         bool = False,
 ) -> dict[str, Any]:
     """End-to-end retrieval evaluation for a sequence model.
 
     Args:
-        model:              Sequence model implementing ``encode_sequence``
-                            and ``get_item_embeddings``.
-        item_seq_arr:       (n_users, max_seq_len) int64 padded item sequences.
-                            Use the train-window array for validation eval and
-                            the full-train array for test eval.
-        event_seq_arr:      (n_users, max_seq_len) int64 padded event sequences,
-                            aligned with item_seq_arr.
-        eval_targets_df:    DataFrame of held-out (user_idx, item_idx) pairs.
-                            Optional ``event_type`` column is used to keep only
-                            cart + purchase rows.  Use ``val_targets.parquet``
-                            for validation and ``test_pairs.parquet`` for test.
-        train_pairs_df:     DataFrame with ``user_idx`` (and ``item_idx``).
-                            Used to build the seen-item filter and to derive
-                            ``trained_item_idxs`` if not supplied.
-        n_items:            Catalog size including PAD (matches model.n_items).
+        model:              Sequence model with ``encode_sequence`` +
+                            ``get_item_embeddings`` interface.
+        item_seq_arr:       (n_users, max_seq_len) int64 padded items.
+                            Use train-window array for val eval, full-train
+                            array for test eval.
+        event_seq_arr:      (n_users, max_seq_len) int64 padded event types.
+        eval_targets_df:    (user_idx, item_idx [, event_type]) ground-truth
+                            pairs.  cart + purchase only if event_type present.
+        train_pairs_df:     (user_idx, item_idx) training interactions.
+                            Used to derive the FAISS index item set and (when
+                            filter_seen=True) the seen-item exclusion set.
+        n_items:            Catalog size including PAD token 0.
         device:             Torch device for inference.
-        batch_size:         Users per encode + search step.
-        n_faiss_candidates: Top-N retrieved before seen-item filtering.
-        trained_item_idxs:  Optional set / array of item_idx values to include
-                            in the FAISS index.  Defaults to
-                            ``train_pairs_df['item_idx'].unique()``.
-        label:              Short descriptor printed in headers (e.g. 'val',
-                            'test') so log readers can tell evals apart.
+        batch_size:         Users per forward + search batch.
+        n_faiss_candidates: Top-N retrieved before optional seen filtering.
+                            Raise this (e.g. 200) when filter_seen=True so
+                            enough candidates survive the filter.
+        trained_item_idxs:  Optional explicit set of item_idx to index.
+                            Auto-derived from train_pairs_df if None.
+        label:              Short tag printed in headers (e.g. 'val', 'test').
+        filter_seen:        If False (default), return the raw top-20 FAISS
+                            results — correct for next-item prediction eval.
+                            If True, remove items seen in train_pairs_df
+                            before capping at 20 — matches V1–V6 protocol.
 
     Returns:
-        Dict with keys: ``recall_10, ndcg_10, recall_20, ndcg_20,
-        n_eval_users, recommendations``.
+        Dict: recall_10, ndcg_10, recall_20, ndcg_20, n_eval_users,
+        recommendations.
     """
-    print(f"\n  ── {label.upper()} EVALUATION ──")
+    filter_tag = "filtered" if filter_seen else "unfiltered"
+    print(f"\n  ── {label.upper()} EVALUATION  [{filter_tag}] ──")
 
     # ── Step 1: FAISS index ────────────────────────────────────────────────
     if trained_item_idxs is None:
@@ -264,21 +312,19 @@ def evaluate_sequence(
 
     # ── Step 2: Ground truth ───────────────────────────────────────────────
     ground_truth = _build_ground_truth_idx(eval_targets_df)
-
-    # Restrict to users that have a row in item_seq_arr (i.e. < n_users).
-    n_users_arr = item_seq_arr.shape[0]
-    eval_users  = [u for u in ground_truth.keys() if 0 <= u < n_users_arr]
-    dropped     = len(ground_truth) - len(eval_users)
+    n_users_arr  = item_seq_arr.shape[0]
+    eval_users   = [u for u in ground_truth.keys() if 0 <= u < n_users_arr]
+    dropped      = len(ground_truth) - len(eval_users)
     if dropped:
-        print(f"  Dropped {dropped:,} users with no row in seq array "
-              f"(out-of-vocab / cold)")
+        print(f"  Dropped {dropped:,} users out of seq array bounds (cold/OOV)")
     print(f"  Eval users : {len(eval_users):,}")
 
-    # ── Step 3: Seen-item filter ──────────────────────────────────────────
+    # ── Step 3: Seen-item filter (build even when filter_seen=False to log diag)
     seen_items = build_seen_items(train_pairs_df)
+    _print_filter_diagnostic(ground_truth, seen_items, eval_users, label)
 
-    # ── Step 4: Encode + retrieve in batches ──────────────────────────────
-    recs_idx_by_user, _ = _retrieve_recommendations(
+    # ── Step 4: Encode + retrieve ──────────────────────────────────────────
+    recs_idx_by_user = _retrieve_recommendations(
         model              = model,
         item_seq_arr       = item_seq_arr,
         event_seq_arr      = event_seq_arr,
@@ -289,6 +335,7 @@ def evaluate_sequence(
         device             = device,
         batch_size         = batch_size,
         n_faiss_candidates = n_faiss_candidates,
+        filter_seen        = filter_seen,
     )
 
     # ── Step 5: Metrics ───────────────────────────────────────────────────
@@ -312,9 +359,9 @@ def evaluate_sequence(
     mean_r20 = float(np.mean(recall_20)) if recall_20 else 0.0
     mean_n20 = float(np.mean(ndcg_20  )) if ndcg_20   else 0.0
 
-    sep = "═" * 44
+    sep = "═" * 48
     print(f"\n  {sep}")
-    print(f"  {label.upper()} RESULTS")
+    print(f"  {label.upper()} RESULTS  [{filter_tag}]")
     print(f"  {sep}")
     print(f"    Eval users : {len(eval_users):,}")
     print(f"    Recall@10  : {mean_r10:.4f}")
@@ -330,6 +377,7 @@ def evaluate_sequence(
         "ndcg_20":         mean_n20,
         "n_eval_users":    len(eval_users),
         "recommendations": recs_idx_by_user,
+        "filter_seen":     filter_seen,
     }
 
 
@@ -354,21 +402,27 @@ def evaluate_sequence_stratified(
     n_faiss_candidates:  int = 100,
     trained_item_idxs:   set | np.ndarray | None = None,
     label:               str = "eval",
+    filter_seen:         bool = False,
 ) -> dict[str, Any]:
-    """Same metrics as ``evaluate_sequence`` plus Cold/Med/Warm cohorts.
+    """Same as ``evaluate_sequence`` plus Cold/Med/Warm cohort breakdown.
 
-    Cohort = number of training-pair rows per user_idx in ``train_pairs_df``:
-        Cold   :  3 - 10
-        Medium : 11 - 50
+    Cohort = number of rows in ``train_pairs_df`` per ``user_idx``:
+        Cold   :  3 – 10
+        Medium : 11 – 50
         Warm   : 51 +
 
-    Returns:
-        Dict keyed by ``overall``, ``cold``, ``medium``, ``warm`` (each a dict
-        of metrics) plus ``recommendations``.
-    """
-    print(f"\n  ── {label.upper()} STRATIFIED EVALUATION ──")
+    ``filter_seen`` has the same semantics as in ``evaluate_sequence``.
+    Pass ``filter_seen=False`` for val (Jan 25–31) and ``filter_seen=True``
+    for the final Feb test eval.
 
-    # ── Step 1: FAISS + ground truth (single pass) ─────────────────────────
+    Returns:
+        Dict keyed by ``overall``, ``cold``, ``medium``, ``warm``,
+        ``recommendations``, ``filter_seen``.
+    """
+    filter_tag = "filtered" if filter_seen else "unfiltered"
+    print(f"\n  ── {label.upper()} STRATIFIED EVALUATION  [{filter_tag}] ──")
+
+    # ── Step 1: FAISS + ground truth ──────────────────────────────────────
     if trained_item_idxs is None:
         trained_item_idxs = set(train_pairs_df["item_idx"].unique().tolist())
         print(f"  Auto-derived trained_item_idxs: {len(trained_item_idxs):,} items")
@@ -382,13 +436,14 @@ def evaluate_sequence_stratified(
     eval_users   = [u for u in ground_truth.keys() if 0 <= u < n_users_arr]
     dropped      = len(ground_truth) - len(eval_users)
     if dropped:
-        print(f"  Dropped {dropped:,} users with no row in seq array")
+        print(f"  Dropped {dropped:,} users out of seq array bounds (cold/OOV)")
     print(f"  Eval users : {len(eval_users):,}")
 
     seen_items = build_seen_items(train_pairs_df)
+    _print_filter_diagnostic(ground_truth, seen_items, eval_users, label)
 
-    # ── Step 2: Retrieve recommendations once for all users ────────────────
-    recs_idx_by_user, _ = _retrieve_recommendations(
+    # ── Step 2: Retrieve for all users ────────────────────────────────────
+    recs_idx_by_user = _retrieve_recommendations(
         model              = model,
         item_seq_arr       = item_seq_arr,
         event_seq_arr      = event_seq_arr,
@@ -399,9 +454,10 @@ def evaluate_sequence_stratified(
         device             = device,
         batch_size         = batch_size,
         n_faiss_candidates = n_faiss_candidates,
+        filter_seen        = filter_seen,
     )
 
-    # ── Step 3: Per-user metrics aligned with eval_users ──────────────────
+    # ── Step 3: Per-user metrics ──────────────────────────────────────────
     per_r10 = np.zeros(len(eval_users), dtype=np.float32)
     per_n10 = np.zeros(len(eval_users), dtype=np.float32)
     per_r20 = np.zeros(len(eval_users), dtype=np.float32)
@@ -443,12 +499,13 @@ def evaluate_sequence_stratified(
     results: dict[str, Any] = {
         "overall":         _cohort_metrics(overall_mask),
         "recommendations": recs_idx_by_user,
+        "filter_seen":     filter_seen,
     }
     for name, lo, hi in _COHORTS:
         mask = (counts_arr >= lo) & (counts_arr <= hi)
         results[name] = _cohort_metrics(mask)
 
-    # ── Step 5: Pretty-print cohort table (matches two-tower formatting) ──
+    # ── Step 5: Pretty-print ──────────────────────────────────────────────
     col_names = ["overall"] + [c[0] for c in _COHORTS]
     col_w     = 12
     metrics_rows: list[tuple[str, str]] = [
@@ -466,8 +523,8 @@ def evaluate_sequence_stratified(
         "warm":    "Warm (51+)",
     }
     label_w = max(len(v) for _, v in metrics_rows) + 2
-    sep   = "═" * (label_w + (col_w + 2) * len(col_names) + 1)
-    thin  = "─" * (label_w + (col_w + 2) * len(col_names) + 1)
+    sep  = "═" * (label_w + (col_w + 2) * len(col_names) + 1)
+    thin = "─" * (label_w + (col_w + 2) * len(col_names) + 1)
 
     def _fmt(key: str, val: float | int) -> str:
         if key == "n_users":
@@ -477,7 +534,7 @@ def evaluate_sequence_stratified(
         return f"{val:>{col_w}.4f}"
 
     print(f"\n  {sep}")
-    print(f"  {label.upper()} STRATIFIED RESULTS")
+    print(f"  {label.upper()} STRATIFIED RESULTS  [{filter_tag}]")
     print(f"  {sep}")
 
     header = f"  {'Metric':<{label_w}}"

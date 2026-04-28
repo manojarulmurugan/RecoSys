@@ -105,7 +105,6 @@ from src.sequence.data.negative_sampler import UniformNegativeSampler
 from src.sequence.data.sequence_dataset import (
     SequenceEvalDataset,
     SequenceTrainDataset,
-    load_sequence_artifacts,
 )
 from src.sequence.evaluation.evaluate_sequence import (
     evaluate_sequence,
@@ -139,7 +138,7 @@ WEIGHT_DECAY    = 1e-5
 N_NEG_SAMPLES   = 512
 N_EPOCHS        = 30
 EVAL_EVERY      = 5
-TEMPERATURE     = 1.0
+TEMPERATURE     = 0.07  # lower temp → sharper distribution → forces model to discriminate
 NUM_WORKERS     = 4
 GRAD_CLIP       = 1.0
 
@@ -228,12 +227,8 @@ def main() -> None:
         bucket = GCS_BUCKET,
         bootstrap_specs = [
             (f"{GCS_MODELS_PREFIX}/vocabs_500k.pkl", ARTIFACTS_DIR / "vocabs.pkl"),
-            (f"{GCS_SEQ_PREFIX}/train_seqs.parquet",
-             SEQ_DIR / "train_seqs.parquet"),
             (f"{GCS_SEQ_PREFIX}/full_train_seqs.parquet",
              SEQ_DIR / "full_train_seqs.parquet"),
-            (f"{GCS_SEQ_PREFIX}/val_targets.parquet",
-             SEQ_DIR / "val_targets.parquet"),
             (f"{GCS_SEQ_PREFIX}/metadata.json",
              SEQ_DIR / "metadata.json"),
         ],
@@ -251,33 +246,24 @@ def main() -> None:
     print(f"  train_pairs  : {train_pairs.shape}")
 
     # ── Load sequence artifacts ───────────────────────────────────────────
-    seqs = load_sequence_artifacts(SEQ_DIR)
-    train_seqs_df      = seqs["train_seqs_df"]
-    full_train_seqs_df = seqs["full_train_seqs_df"]
-    val_targets_df     = seqs["val_targets_df"]
-    metadata           = seqs["metadata"]
-    print(f"  train_seqs       : {len(train_seqs_df):,} users")
+    # Training uses full_train_seqs (all events through Jan 31) to match the
+    # V1–V6 protocol: train on Oct–Jan, evaluate on Feb.
+    full_train_seqs_df = pd.read_parquet(SEQ_DIR / "full_train_seqs.parquet")
+    with open(SEQ_DIR / "metadata.json") as f:
+        metadata: dict = json.load(f)
     print(f"  full_train_seqs  : {len(full_train_seqs_df):,} users")
-    print(f"  val_targets      : {len(val_targets_df):,} rows")
-    print(f"  metadata         : train_end={metadata['train_end']}  "
-          f"val_end={metadata['val_end']}")
+    print(f"  metadata         : val_end={metadata['val_end']}")
 
     # ── Datasets ──────────────────────────────────────────────────────────
     print("\nBuilding datasets (this materialises the padded user arrays)...")
     train_dataset = SequenceTrainDataset(
-        train_seqs_df = train_seqs_df,
+        train_seqs_df = full_train_seqs_df,
         n_users       = n_users_total,
         max_seq_len   = MAX_SEQ_LEN,
     )
-    print(f"  {train_dataset!r}")
+    print(f"  {train_dataset!r}  (train — all of Oct–Jan)")
 
-    val_eval = SequenceEvalDataset(
-        seqs_df     = train_seqs_df,
-        n_users     = n_users_total,
-        max_seq_len = MAX_SEQ_LEN,
-    )
-    print(f"  {val_eval!r}  (validation encoder)")
-
+    # One encoder for evaluation: same full-train sequences.
     test_eval = SequenceEvalDataset(
         seqs_df     = full_train_seqs_df,
         n_users     = n_users_total,
@@ -399,49 +385,20 @@ def main() -> None:
             ckpt_path,
         )
 
-        # Periodic evaluation on the held-out Jan 25–31 window.
-        if epoch % EVAL_EVERY == 0:
-            print(f"\n  --- Validation eval at epoch {epoch} ---")
-            val_metrics = evaluate_sequence(
-                model              = model,
-                item_seq_arr       = val_eval.item_seq_arr,
-                event_seq_arr      = val_eval.event_seq_arr,
-                eval_targets_df    = val_targets_df,
-                train_pairs_df     = train_pairs,
-                n_items            = n_items_total,
-                device             = DEVICE,
-                batch_size         = 512,
-                n_faiss_candidates = 100,
-                label              = f"val (epoch {epoch})",
-            )
-            evaluate_sequence_stratified(
-                model              = model,
-                item_seq_arr       = val_eval.item_seq_arr,
-                event_seq_arr      = val_eval.event_seq_arr,
-                eval_targets_df    = val_targets_df,
-                train_pairs_df     = train_pairs,
-                n_items            = n_items_total,
-                device             = DEVICE,
-                batch_size         = 512,
-                n_faiss_candidates = 100,
-                label              = f"val (epoch {epoch})",
-            )
-
-            log_entry = {
-                "epoch":         epoch,
-                "train_loss":    round(epoch_loss, 6),
-                "val_recall_10": round(val_metrics["recall_10"], 6),
-                "val_ndcg_10":   round(val_metrics["ndcg_10"],   6),
-                "val_recall_20": round(val_metrics["recall_20"], 6),
-                "val_ndcg_20":   round(val_metrics["ndcg_20"],   6),
-                "lr":            round(current_lr, 8),
-            }
-            training_log.append(log_entry)
-            with open(log_path, "w") as f:
-                json.dump(training_log, f, indent=2)
-            print(f"  training_log.json updated ({len(training_log)} entries)")
+        # Log train loss every epoch (no val set — training on full Jan data).
+        log_entry = {
+            "epoch":      epoch,
+            "train_loss": round(epoch_loss, 6),
+            "lr":         round(current_lr, 8),
+        }
+        training_log.append(log_entry)
+        with open(log_path, "w") as f:
+            json.dump(training_log, f, indent=2)
 
     # ── Final test evaluation ─────────────────────────────────────────────
+    # filter_seen=True: mirrors the V1–V6 protocol so V7 numbers slot into
+    # the comparison table.  The Feb window is 5+ weeks after training ends
+    # so a meaningful fraction of ground-truth items are genuinely new.
     _section("V7 — Final test evaluation")
     test_metrics = evaluate_sequence(
         model              = model,
@@ -452,8 +409,9 @@ def main() -> None:
         n_items            = n_items_total,
         device             = DEVICE,
         batch_size         = 512,
-        n_faiss_candidates = 100,
+        n_faiss_candidates = 200,
         label              = "test (final)",
+        filter_seen        = True,
     )
     test_strat = evaluate_sequence_stratified(
         model              = model,
@@ -464,8 +422,9 @@ def main() -> None:
         n_items            = n_items_total,
         device             = DEVICE,
         batch_size         = 512,
-        n_faiss_candidates = 100,
+        n_faiss_candidates = 200,
         label              = "test (final)",
+        filter_seen        = True,
     )
 
     final_results = {
