@@ -17,7 +17,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from src.two_tower.data.dataset import TwoTowerDataset, build_full_item_tensors
+from src.two_tower.data.dataset import (
+    TwoTowerDataset,
+    TwoTowerDatasetWithHardNegs,
+    TwoTowerDatasetWithSeq,
+    build_full_item_tensors,
+)
 from src.two_tower.models.two_tower import TwoTowerModel
 
 
@@ -26,34 +31,96 @@ from src.two_tower.models.two_tower import TwoTowerModel
 def in_batch_loss(
     scores: torch.Tensor,
     confidence_weights: torch.Tensor | None = None,
+    log_q_correction: torch.Tensor | None = None,
+    label_smoothing: float = 0.0,
 ) -> torch.Tensor:
-    """In-batch negative cross-entropy loss with optional confidence weighting.
+    """In-batch negative cross-entropy loss with optional confidence weighting,
+    LogQ sampling-bias correction, and label smoothing.
 
     Each row i of `scores` is treated as logits over B classes; the correct
     class is i (the diagonal positive pair).
 
-    When `confidence_weights` is provided, per-sample losses are scaled by
-    normalised confidence so higher-confidence interactions (e.g. purchases)
-    contribute proportionally more gradient than lower-confidence ones
-    (e.g. views). Weights are normalised to mean=1 so overall loss magnitude
-    stays comparable to the unweighted case.
+    **LogQ correction** (YouTube Two-Tower paper, 2019): popular items appear
+    as in-batch negatives more often than rare items, so the model is
+    over-penalised for scoring them highly.  Subtracting ``log(q(item_j))``
+    from column j of the logit matrix removes this frequency bias.  Pass the
+    pre-computed log-frequency values for the B items in the current batch.
+
+    **Confidence weighting**: when provided, per-sample losses are scaled by
+    normalised confidence so purchases contribute more gradient than views.
+    Weights are normalised to mean=1 to keep loss magnitude stable.
+
+    **Label smoothing**: distributes a small amount of probability mass to
+    non-target classes, preventing overconfident predictions.
 
     Args:
         scores:             (B, B) scaled dot-product similarity matrix.
         confidence_weights: (B,) float tensor of raw confidence scores, or
                             None for uniform weighting.
+        log_q_correction:   (B,) float tensor of log(q(item)) for each item
+                            in the batch, where q(item) is its sampling
+                            probability in training data.  Subtracted
+                            column-wise from ``scores`` before cross-entropy.
+                            Pass None to disable (default).
+        label_smoothing:    Label smoothing factor in [0, 1).  0.0 disables.
 
     Returns:
         Scalar loss tensor.
     """
+    if log_q_correction is not None:
+        # Subtract log(q(item_j)) from every column j.
+        # log_q_correction shape: (B,) → unsqueeze to (1, B) for broadcasting.
+        scores = scores - log_q_correction.unsqueeze(0)
+
     labels = torch.arange(scores.size(0), device=scores.device)
 
     if confidence_weights is None:
-        return F.cross_entropy(scores, labels)
+        return F.cross_entropy(scores, labels, label_smoothing=label_smoothing)
 
-    per_sample_loss = F.cross_entropy(scores, labels, reduction="none")
+    per_sample_loss = F.cross_entropy(
+        scores, labels, reduction="none", label_smoothing=label_smoothing
+    )
     norm_weights = confidence_weights / confidence_weights.mean()
     return (per_sample_loss * norm_weights).mean()
+
+
+def in_batch_loss_with_hard_negs(
+    user_embs: torch.Tensor,
+    pos_item_embs: torch.Tensor,
+    hard_neg_item_embs: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """In-batch negative cross-entropy loss augmented with pre-mined hard negatives.
+
+    For each user i the logits contain:
+      • B in-batch scores  (diagonal entry i is the true positive)
+      • 3 hard-negative scores appended as extra columns
+
+    The label for every row is still i (the diagonal positive), so standard
+    cross-entropy over the enlarged (B, B+K) matrix is correct.
+
+    Args:
+        user_embs:          (B, 64) L2-normalised user embeddings.
+        pos_item_embs:      (B, 64) L2-normalised positive item embeddings.
+        hard_neg_item_embs: (B, K, 64) L2-normalised hard negative embeddings.
+        temperature:        Softmax temperature scalar.
+
+    Returns:
+        Scalar cross-entropy loss.
+    """
+    B = user_embs.size(0)
+
+    # (B, B) — standard in-batch similarity matrix
+    S_inbatch = (user_embs @ pos_item_embs.T) / temperature
+
+    # (B, K) — each user dot-producted against its own K hard negatives
+    S_hard = torch.einsum("bd,bkd->bk", user_embs, hard_neg_item_embs) / temperature
+
+    # (B, B+K) — hard negs appended as extra negative columns
+    S = torch.cat([S_inbatch, S_hard], dim=1)
+
+    labels = torch.arange(B, device=user_embs.device)
+    return F.cross_entropy(S, labels)
 
 
 # ── Single Epoch ──────────────────────────────────────────────────────────────
@@ -65,6 +132,8 @@ def train_epoch(
     device: torch.device,
     log_every: int = 100,
     use_confidence_weighting: bool = False,
+    log_q_correction_arr: np.ndarray | None = None,
+    label_smoothing: float = 0.0,
 ) -> float:
     """Run one full training epoch.
 
@@ -76,6 +145,16 @@ def train_epoch(
         log_every:                Print a progress line every this many batches.
         use_confidence_weighting: If True, weight each pair's loss by its
                                   normalised confidence score.
+        log_q_correction_arr:     Optional float32 numpy array of shape
+                                  (n_items,) holding ``log(q(item))`` for every
+                                  item_idx, where ``q`` is the item's empirical
+                                  sampling frequency in training pairs.  Each
+                                  batch, the values for the current B items are
+                                  looked up and passed to ``in_batch_loss`` as
+                                  the LogQ correction (YouTube Two-Tower, 2019).
+                                  Pass None to disable (default).
+        label_smoothing:          Label smoothing factor forwarded to
+                                  ``in_batch_loss``.  0.0 disables (default).
 
     Returns:
         Mean loss across all batches in the epoch.
@@ -96,12 +175,184 @@ def train_epoch(
 
         _, _, scores = model(user_idx, user_cat, user_dense, item_cat, item_dense)
 
-        # Confidence weighting: disabled by default (neutral on 50k experiments)
-        # Set use_confidence_weighting=True to enable — see reports/05_model_experiments_50k.md
-        if use_confidence_weighting:
-            loss = in_batch_loss(scores, conf)
-        else:
-            loss = in_batch_loss(scores)
+        # LogQ correction: look up log(q(item)) for the B items in this batch
+        log_q: torch.Tensor | None = None
+        if log_q_correction_arr is not None:
+            item_idxs_cpu = batch["item_idx"].numpy()
+            log_q = torch.tensor(
+                log_q_correction_arr[item_idxs_cpu], dtype=torch.float32, device=device
+            )
+
+        loss = in_batch_loss(
+            scores,
+            conf if use_confidence_weighting else None,
+            log_q,
+            label_smoothing,
+        )
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+        if (batch_idx + 1) % log_every == 0:
+            print(f"  batch {batch_idx + 1}/{total_batches} — loss: {loss.item():.4f}")
+
+    return total_loss / total_batches
+
+
+def train_epoch_with_hard_negs(
+    model: TwoTowerModel,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    temperature: float,
+    device: torch.device,
+    log_every: int = 100,
+) -> float:
+    """Run one full training epoch using pre-mined hard negatives.
+
+    Mirrors train_epoch exactly, with three additions:
+      1. Unpacks ``batch['hard_neg_idxs']`` — shape (B, K) of item indices.
+      2. Resolves hard-neg feature tensors from the dataset's pre-built numpy
+         lookup arrays (``dataset._item_cat`` / ``dataset._item_dense``),
+         the same arrays used to serve positive item features in __getitem__.
+      3. Calls in_batch_loss_with_hard_negs instead of in_batch_loss.
+
+    The DataLoader must wrap a TwoTowerDatasetWithHardNegs instance.
+
+    Args:
+        model:       TwoTowerModel instance.
+        dataloader:  DataLoader built from TwoTowerDatasetWithHardNegs.
+        optimizer:   Optimiser (e.g. AdamW).
+        temperature: Softmax temperature passed to in_batch_loss_with_hard_negs.
+        device:      Target device.
+        log_every:   Print a progress line every this many batches.
+
+    Returns:
+        Mean loss across all batches in the epoch.
+    """
+    model.train()
+    total_loss    = 0.0
+    total_batches = len(dataloader)
+
+    # Cache the numpy feature arrays once — same arrays backing __getitem__
+    item_cat_arr   = dataloader.dataset._item_cat    # (n_items, 5) int64
+    item_dense_arr = dataloader.dataset._item_dense  # (n_items, 3) float32
+
+    for batch_idx, batch in enumerate(dataloader):
+        user_idx   = batch["user_idx"].to(device)
+        user_cat   = batch["user_cat"].to(device)
+        user_dense = batch["user_dense"].to(device)
+        item_cat   = batch["item_cat"].to(device)
+        item_dense = batch["item_dense"].to(device)
+
+        # hard_neg_idxs: (B, K) int64 — item indices for pre-mined hard negatives
+        hard_neg_idxs = batch["hard_neg_idxs"]   # keep on CPU for numpy indexing
+        B, K = hard_neg_idxs.shape
+
+        # Resolve hard-neg features using the same lookup arrays as __getitem__
+        flat_idxs = hard_neg_idxs.reshape(-1).numpy()          # (B*K,)
+        hn_cat_t   = torch.tensor(
+            item_cat_arr[flat_idxs], dtype=torch.long
+        ).to(device)                                             # (B*K, 5)
+        hn_dense_t = torch.tensor(
+            item_dense_arr[flat_idxs], dtype=torch.float32
+        ).to(device)                                             # (B*K, 3)
+
+        optimizer.zero_grad()
+
+        # Encode users and positive items (mirrors model.forward internals)
+        user_embs     = model.user_tower(user_idx, user_cat, user_dense)  # (B, 64)
+        pos_item_embs = model.item_tower(item_cat, item_dense)             # (B, 64)
+
+        # Encode all hard negatives in one batched pass, then reshape
+        hn_embs_flat  = model.item_tower(hn_cat_t, hn_dense_t)            # (B*K, 64)
+        hard_neg_embs = hn_embs_flat.view(B, K, -1)                       # (B, K, 64)
+
+        loss = in_batch_loss_with_hard_negs(
+            user_embs, pos_item_embs, hard_neg_embs, temperature
+        )
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+        if (batch_idx + 1) % log_every == 0:
+            print(f"  batch {batch_idx + 1}/{total_batches} — loss: {loss.item():.4f}")
+
+    return total_loss / total_batches
+
+
+# ── Sequential Epoch ──────────────────────────────────────────────────────────
+
+def train_epoch_sequential(
+    model: TwoTowerModel,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    log_every: int = 100,
+    use_confidence_weighting: bool = False,
+    log_q_correction_arr: np.ndarray | None = None,
+    label_smoothing: float = 0.0,
+) -> float:
+    """Run one full training epoch for a model with a SequentialUserTower.
+
+    Identical to ``train_epoch`` except it additionally unpacks
+    ``batch['user_seq']`` — a ``(B, seq_len)`` LongTensor of item history
+    indices — and passes it to the model forward as ``user_seq=``.
+
+    The DataLoader must wrap a ``TwoTowerDatasetWithSeq`` instance.
+
+    Args:
+        model:                    TwoTowerModel whose user_tower is a
+                                  SequentialUserTower.
+        dataloader:               DataLoader from TwoTowerDatasetWithSeq.
+        optimizer:                Optimiser (e.g. AdamW).
+        device:                   Target device.
+        log_every:                Print a progress line every this many batches.
+        use_confidence_weighting: Scale per-sample loss by normalised confidence.
+        log_q_correction_arr:     Optional float32 numpy array of shape
+                                  (n_items,) with log(q(item)) for LogQ
+                                  correction (YouTube Two-Tower, 2019).
+        label_smoothing:          Label smoothing factor forwarded to
+                                  ``in_batch_loss``.  0.0 disables (default).
+
+    Returns:
+        Mean loss across all batches in the epoch.
+    """
+    model.train()
+    total_loss    = 0.0
+    total_batches = len(dataloader)
+
+    for batch_idx, batch in enumerate(dataloader):
+        user_idx   = batch["user_idx"].to(device)
+        user_cat   = batch["user_cat"].to(device)
+        user_dense = batch["user_dense"].to(device)
+        user_seq   = batch["user_seq"].to(device)     # (B, seq_len)
+        item_cat   = batch["item_cat"].to(device)
+        item_dense = batch["item_dense"].to(device)
+        conf       = batch["confidence"].to(device)
+
+        optimizer.zero_grad()
+
+        _, _, scores = model(
+            user_idx, user_cat, user_dense, item_cat, item_dense, user_seq=user_seq
+        )
+
+        log_q: torch.Tensor | None = None
+        if log_q_correction_arr is not None:
+            item_idxs_cpu = batch["item_idx"].numpy()
+            log_q = torch.tensor(
+                log_q_correction_arr[item_idxs_cpu], dtype=torch.float32, device=device
+            )
+
+        loss = in_batch_loss(
+            scores,
+            conf if use_confidence_weighting else None,
+            log_q,
+            label_smoothing,
+        )
 
         loss.backward()
         optimizer.step()
@@ -204,7 +455,8 @@ def train(
         log_every:                Batch logging frequency inside each epoch.
         eval_every:               If > 0, call `eval_fn(model)` every N epochs.
         eval_fn:                  Optional callable taking the model and returning
-                                  a metrics dict (expected keys: 'recall@10', 'ndcg@10').
+                                  a metrics dict (expected keys: 'recall_10', 'ndcg_10',
+                                  'recall_20', 'ndcg_20').
         lr_eta_min:               Minimum learning rate at the end of cosine decay.
         use_confidence_weighting: If True, scale each pair's loss by its normalised
                                   confidence score (purchases outweigh views).
@@ -253,8 +505,10 @@ def train(
 
         if eval_every > 0 and eval_fn is not None and epoch % eval_every == 0:
             metrics = eval_fn(model)
-            print(f"  → Recall@10: {metrics.get('recall@10', 0):.4f}  "
-                  f"NDCG@10: {metrics.get('ndcg@10', 0):.4f}")
+            print(f"  → Recall@10: {metrics.get('recall_10', 0):.4f}  "
+                  f"NDCG@10: {metrics.get('ndcg_10', 0):.4f}  "
+                  f"Recall@20: {metrics.get('recall_20', 0):.4f}  "
+                  f"NDCG@20: {metrics.get('ndcg_20', 0):.4f}")
 
         torch.save(
             {
