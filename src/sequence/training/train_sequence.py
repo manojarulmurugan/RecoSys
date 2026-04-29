@@ -184,3 +184,103 @@ def train_epoch_sequence(
         f"({n_pos_total:,} positions, {elapsed // 60}m {elapsed % 60}s)"
     )
     return epoch_loss
+
+
+# ── Session-based full-softmax training loop (V9) ────────────────────────────
+
+def train_epoch_session(
+    model:           SequenceModel,
+    dataloader:      DataLoader,
+    optimizer:       torch.optim.Optimizer,
+    device:          torch.device,
+    label_smoothing: float = 0.1,
+    grad_clip:       float | None = 1.0,
+    log_every:       int = 200,
+) -> float:
+    """One epoch of full-softmax training for session-based next-item prediction.
+
+    Key differences from ``train_epoch_sequence`` (sampled softmax):
+      - Logits computed over ALL catalog items: out @ item_embs.T  (B*L, n_items).
+      - PAD positions excluded via ``ignore_index=0`` in cross_entropy, no mask
+        arithmetic needed.
+      - Label smoothing 0.1 per T4Rec sec. 3.2 convention.
+      - No UniformNegativeSampler dependency.
+
+    Memory note: peak activation ~2 x (B * (L-1) * n_items * 4 bytes).
+    With B=256, L=20, n_items=284k: ~11 GB — fits on A100.
+    Reduce batch_size to 64-128 for V100/T4.
+
+    Args:
+        model:           SequenceModel with ``forward`` + ``get_item_embeddings``.
+        dataloader:      Yields dicts with keys ``input_seq``, ``input_event_seq``,
+                         ``target_seq`` (from ``SessionTrainDataset``).
+        optimizer:       AdamW.
+        device:          Torch device.
+        label_smoothing: CE label-smoothing factor (default 0.1).
+        grad_clip:       Max global L2 grad norm (None = disabled).
+        log_every:       Print loss every N steps (0 = silent).
+
+    Returns:
+        Mean per-position CE loss over the epoch (PAD positions excluded).
+    """
+    model.train()                                       # type: ignore[attr-defined]
+    total_loss_weighted = 0.0
+    n_pos_total         = 0
+    t0                  = time.time()
+    last_log_time       = t0
+
+    for step, batch in enumerate(dataloader, start=1):
+        input_seq  = batch["input_seq"].to(device,        non_blocking=True)
+        event_seq  = batch["input_event_seq"].to(device,  non_blocking=True)
+        target_seq = batch["target_seq"].to(device,       non_blocking=True)
+
+        n_pos = int((target_seq != 0).sum().item())
+        if n_pos == 0:
+            continue
+
+        # (B, L, D) — per-position L2-normalised user embeddings.
+        out = model.forward(input_seq, event_seq)
+
+        # (n_items, D) — tied item embeddings, same as FAISS payload at eval.
+        item_embs = model.get_item_embeddings()
+
+        # Full cosine-similarity logits over all catalog items.
+        logits = (out @ item_embs.T).view(-1, item_embs.size(0))   # (B*L, n_items)
+
+        loss = F.cross_entropy(
+            logits,
+            target_seq.view(-1),
+            ignore_index    = 0,
+            label_smoothing = label_smoothing,
+        )
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),                     # type: ignore[arg-type]
+                max_norm = grad_clip,
+            )
+        optimizer.step()
+
+        total_loss_weighted += float(loss.item()) * n_pos
+        n_pos_total         += n_pos
+
+        if log_every and step % log_every == 0:
+            now          = time.time()
+            running_loss = total_loss_weighted / max(n_pos_total, 1)
+            steps_per_s  = log_every / max(now - last_log_time, 1e-6)
+            print(
+                f"    step {step:>5,}/{len(dataloader):,}  "
+                f"loss {running_loss:.4f}  "
+                f"({steps_per_s:.1f} steps/s)"
+            )
+            last_log_time = now
+
+    epoch_loss = total_loss_weighted / max(n_pos_total, 1)
+    elapsed    = int(time.time() - t0)
+    print(
+        f"  epoch loss : {epoch_loss:.4f}  "
+        f"({n_pos_total:,} positions, {elapsed // 60}m {elapsed % 60}s)"
+    )
+    return epoch_loss
