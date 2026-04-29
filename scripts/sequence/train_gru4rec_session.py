@@ -128,7 +128,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint-dir",  default=None,
                    help="Defaults to <artifacts-dir>/sequences_v2/checkpoints_v9_gru4rec_session")
     # Model
-    p.add_argument("--embed-dim",    type=int,   default=64)
+    p.add_argument("--embed-dim",    type=int,   default=128)
     p.add_argument("--gru-hidden",   type=int,   default=256)
     p.add_argument("--n-layers",     type=int,   default=1)
     p.add_argument("--dropout",      type=float, default=0.3)
@@ -136,7 +136,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--epochs",           type=int,   default=30)
     p.add_argument("--batch-size",       type=int,   default=256,
                    help="256 for A100 (11 GB peak). Use 64-128 for V100/T4.")
-    p.add_argument("--lr",               type=float, default=1e-3)
+    p.add_argument("--lr",               type=float, default=3e-4)
+    p.add_argument("--lr-min",           type=float, default=1e-5,
+                   help="Minimum LR for CosineAnnealingLR scheduler.")
+    p.add_argument("--scheduler",        type=str,   default="cosine",
+                   choices=["cosine", "none"],
+                   help="LR scheduler: cosine (CosineAnnealingLR) or none.")
     p.add_argument("--weight-decay",     type=float, default=1e-5)
     p.add_argument("--label-smoothing",  type=float, default=0.1)
     p.add_argument("--grad-clip",        type=float, default=1.0)
@@ -186,6 +191,7 @@ def main() -> None:
     print(f"  gru_hidden      : {args.gru_hidden}  (n_layers={args.n_layers})")
     print(f"  dropout         : {args.dropout}")
     print(f"  lr              : {args.lr}  wd={args.weight_decay}")
+    print(f"  scheduler       : {args.scheduler}  (lr_min={args.lr_min})")
     print(f"  label_smoothing : {args.label_smoothing}")
 
     # ── Load vocabs ───────────────────────────────────────────────────────
@@ -240,6 +246,12 @@ def main() -> None:
         get_param_groups(model, lr=args.lr, weight_decay=args.weight_decay),
     )
 
+    scheduler = None
+    if args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=args.lr_min,
+        )
+
     # ── Save hyperparameters ──────────────────────────────────────────────
     hparams: dict[str, Any] = {
         "model":            "GRU4RecModel",
@@ -257,6 +269,8 @@ def main() -> None:
         "label_smoothing":  args.label_smoothing,
         "grad_clip":        args.grad_clip,
         "patience":         args.patience,
+        "scheduler":        args.scheduler,
+        "lr_min":           args.lr_min,
         "seed":             args.seed,
         "loss":             "full_softmax",
         "started_at":       _now_iso(),
@@ -385,6 +399,12 @@ def main() -> None:
             "val_hr_20":    val_metrics["hr_20"],
             "val_ndcg_20":  val_ndcg20,
         }, step=epoch)
+
+        # ── LR scheduler step ──────────────────────────────────────────
+        if scheduler is not None:
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(f"  LR -> {current_lr:.2e}")
 
         # ── Early stopping ─────────────────────────────────────────────
         if patience_ctr >= args.patience:
