@@ -193,16 +193,21 @@ def train_epoch_session(
     dataloader:      DataLoader,
     optimizer:       torch.optim.Optimizer,
     device:          torch.device,
+    temperature:     float = 0.07,
     label_smoothing: float = 0.1,
     grad_clip:       float | None = 1.0,
     log_every:       int = 200,
+    step_scheduler:  torch.optim.lr_scheduler.LRScheduler | None = None,
 ) -> float:
     """One epoch of full-softmax training for session-based next-item prediction.
 
     Key differences from ``train_epoch_sequence`` (sampled softmax):
       - Logits computed over ALL catalog items: out @ item_embs.T  (B*L, n_items).
-      - PAD positions excluded via ``ignore_index=0`` in cross_entropy, no mask
-        arithmetic needed.
+      - Temperature scaling (default 0.07): without it, cosine similarities in
+        [-1, 1] give near-zero gradients over 284K items — a well-trained model
+        can only reach loss~10.5, making the 11.4 plateau mathematically inevitable.
+        At tau=0.07 the gradient is 14x stronger and loss can reach ~1-2.
+      - PAD positions excluded via ``ignore_index=0`` in cross_entropy.
       - Label smoothing 0.1 per T4Rec sec. 3.2 convention.
       - No UniformNegativeSampler dependency.
 
@@ -216,6 +221,8 @@ def train_epoch_session(
                          ``target_seq`` (from ``SessionTrainDataset``).
         optimizer:       AdamW.
         device:          Torch device.
+        temperature:     Logit scaling: logits /= temperature before softmax.
+                         0.07 is standard for cosine-similarity contrastive losses.
         label_smoothing: CE label-smoothing factor (default 0.1).
         grad_clip:       Max global L2 grad norm (None = disabled).
         log_every:       Print loss every N steps (0 = silent).
@@ -244,8 +251,9 @@ def train_epoch_session(
         # (n_items, D) — tied item embeddings, same as FAISS payload at eval.
         item_embs = model.get_item_embeddings()
 
-        # Full cosine-similarity logits over all catalog items.
-        logits = (out @ item_embs.T).view(-1, item_embs.size(0))   # (B*L, n_items)
+        # Full cosine-similarity logits over all catalog items, temperature-scaled.
+        # Without temperature, cosine sims in [-1,1] give near-zero gradients at 284K scale.
+        logits = (out @ item_embs.T).view(-1, item_embs.size(0)) / temperature  # (B*L, n_items)
 
         loss = F.cross_entropy(
             logits,
@@ -262,6 +270,8 @@ def train_epoch_session(
                 max_norm = grad_clip,
             )
         optimizer.step()
+        if step_scheduler is not None:
+            step_scheduler.step()
 
         total_loss_weighted += float(loss.item()) * n_pos
         n_pos_total         += n_pos

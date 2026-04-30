@@ -109,6 +109,20 @@ class SASRecModel(nn.Module):
         with torch.no_grad():
             self.item_emb.weight [0].zero_()
             self.event_emb.weight[0].zero_()
+        # trunc-normal std=0.02 for all attention + FFN weights in the encoder.
+        # PyTorch Xavier default is too large at 284K-item scale and causes
+        # embedding-space collapse around epoch 6.
+        for module in self.encoder.modules():
+            if isinstance(module, nn.MultiheadAttention):
+                nn.init.trunc_normal_(module.in_proj_weight,  std=0.02)
+                nn.init.trunc_normal_(module.out_proj.weight, std=0.02)
+                if module.in_proj_bias is not None:
+                    nn.init.zeros_(module.in_proj_bias)
+                nn.init.zeros_(module.out_proj.bias)
+            elif isinstance(module, nn.Linear):
+                nn.init.trunc_normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(
         self,
