@@ -9,20 +9,28 @@ Architecture choices in this implementation:
       (eSASRec, RecSys 2025).
     * Causal mask + key padding mask so each position attends only to past
       real items.
-    * L2-normalised output so dot-product scores in the loss / FAISS index
-      are in [-1, 1] and the temperature has the same meaning across runs.
+    * Raw (un-normalised) output and item embeddings — the canonical SASRec
+      scoring convention used by pmixer/SASRec.pytorch, gSASRec and RecBole.
+      L2-normalising both sides bounds logits to [-1, 1], creates a hard
+      sampled-softmax loss floor, and routes all gradient through the
+      rank-deficient ``F.normalize`` Jacobian, which combined with attention
+      rank-collapse traps the model in a degenerate basin where the output
+      is near-constant across users (HR/NDCG below the popularity baseline).
+    * Learnable scalar ``log_scale`` so the loss can multiply raw dot
+      products by a positive scalar (NormFace convention) without coupling
+      effective LR to the growth rate of embedding magnitudes.
 
 Public interface (shared with GRU4Rec):
-    forward(item_seq, event_seq)         → (B, L, D)
-    encode_sequence(item_seq, event_seq)  → (B, D)        last position
-    get_item_embeddings()                 → (n_items, D)  L2-normalised
+    forward(item_seq, event_seq)         → (B, L, D)        un-normalised
+    encode_sequence(item_seq, event_seq)  → (B, D)          last position
+    get_item_embeddings()                 → (n_items, D)    un-normalised
+    log_scale                             → (1,) Parameter  loss-time scaling
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class SASRecModel(nn.Module):
@@ -89,6 +97,12 @@ class SASRecModel(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.out_ln  = nn.LayerNorm(embed_dim)
 
+        # Learnable logit scale (NormFace).  exp(0) = 1.0 at init so loss
+        # at step 0 sees raw dot products; the loss multiplies its logits
+        # by ``self.log_scale.exp()`` so the model can quickly find the
+        # right magnitude for the contrastive objective.
+        self.log_scale = nn.Parameter(torch.zeros(1))
+
         # Precompute causal mask once.  Shape (max_seq_len, max_seq_len),
         # upper-triangle True = "cannot attend to this position" so each
         # position only sees its past + itself.  Bool dtype keeps it
@@ -136,9 +150,9 @@ class SASRecModel(nn.Module):
             event_seq: (B, L) long tensor of event-type idxs (0 = PAD).
 
         Returns:
-            (B, L, D) float tensor — L2-normalised user embedding at every
-            position.  Padded positions are still computed but excluded
-            from the loss via ``target_mask``.
+            (B, L, D) float tensor — raw (un-normalised) user embedding at
+            every position.  Padded positions are still computed but
+            excluded from the loss via ``target_mask``.
         """
         L = item_seq.size(1)
         if L > self.max_seq_len:
@@ -173,7 +187,7 @@ class SASRecModel(nn.Module):
             mask                = self.causal_mask[:L, :L],
             src_key_padding_mask = key_padding_mask,
         )
-        return F.normalize(self.out_ln(h), dim=-1)
+        return self.out_ln(h)
 
     def encode_sequence(
         self,
@@ -190,17 +204,18 @@ class SASRecModel(nn.Module):
             event_seq: (B, L) long tensor.
 
         Returns:
-            (B, D) L2-normalised float tensor.
+            (B, D) raw (un-normalised) float tensor.
         """
         return self.forward(item_seq, event_seq)[:, -1, :]
 
     def get_item_embeddings(self) -> torch.Tensor:
-        """Return ``(n_items, D)`` L2-normalised item embeddings.
+        """Return ``(n_items, D)`` raw (un-normalised) item embeddings.
 
         Used by both the training loss (positive/negative score lookup)
-        and the FAISS index at eval time.
+        and the FAISS index at eval time.  Callers that need cosine
+        similarity must normalise externally; SASRec scoring is raw IP.
         """
-        return F.normalize(self.item_emb.weight, dim=-1)
+        return self.item_emb.weight
 
     def model_summary(self) -> None:
         """Print parameter counts and config."""

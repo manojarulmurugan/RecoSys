@@ -143,11 +143,19 @@ def _build_item_faiss_index(
     n_items:           int,
     trained_item_idxs: set | np.ndarray | None,
     device:            torch.device,
+    normalize:         bool = True,
 ) -> tuple[np.ndarray, np.ndarray, faiss.Index]:
     """Build a FAISS IndexFlatIP over trained item embeddings.
 
+    Args:
+        normalize: If True (default), L2-normalise embeddings before adding
+                   to the index — turns IP into cosine similarity.  Required
+                   for models trained under cosine (GRU4Rec V9).  Set False
+                   for models trained under raw dot product (SASRec V10
+                   canonical), where popularity-aware magnitude is signal.
+
     Returns:
-        embeddings:      (n_indexed, D) float32, L2-normalised.
+        embeddings:      (n_indexed, D) float32; L2-normalised iff ``normalize``.
         item_idx_array:  (n_indexed,)   int64 — item_idx per row.
         index:           Ready FAISS index.
     """
@@ -172,13 +180,14 @@ def _build_item_faiss_index(
 
     item_idx_array = np.where(keep_mask)[0].astype(np.int64)
     embeddings     = all_embs[item_idx_array].copy()
-    faiss.normalize_L2(embeddings)
+    if normalize:
+        faiss.normalize_L2(embeddings)
 
     index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
     print(
         f"  FAISS index : {embeddings.shape[0]:,} items × {embeddings.shape[1]} dims "
-        f"(filtered from {n_items:,} catalog items)"
+        f"(filtered from {n_items:,} catalog items, normalize={normalize})"
     )
     return embeddings, item_idx_array, index
 
@@ -197,6 +206,7 @@ def _retrieve_recommendations(
     batch_size:          int,
     n_faiss_candidates:  int,
     filter_seen:         bool,
+    normalize:           bool = True,
 ) -> dict[int, list[int]]:
     """Encode users, run FAISS, and return per-user top-20 item_idx lists.
 
@@ -224,7 +234,8 @@ def _retrieve_recommendations(
 
             user_embs    = model.encode_sequence(item_batch, event_batch)
             user_embs_np = user_embs.detach().cpu().numpy().astype(np.float32)
-            faiss.normalize_L2(user_embs_np)
+            if normalize:
+                faiss.normalize_L2(user_embs_np)
 
             _, faiss_indices = index.search(user_embs_np, n_faiss_candidates)
 
@@ -595,6 +606,7 @@ def evaluate_sessions(
     batch_size:          int = 512,
     n_faiss_candidates:  int = 50,
     label:               str = "test",
+    normalize:           bool = True,
 ) -> dict[str, Any]:
     """Session-based next-item-prediction evaluation (T4Rec §4.1.3 protocol).
 
@@ -619,6 +631,12 @@ def evaluate_sessions(
         n_faiss_candidates: Top-N retrieved from FAISS per session.
                             Must be ≥ 20 for HR@20 / NDCG@20 to be meaningful.
         label:              Short tag for printed headers.
+        normalize:          If True (default), L2-normalise FAISS index payload
+                            and query embeddings — turns IP into cosine.
+                            Required for cosine-trained models (GRU4Rec V9).
+                            Set False for raw-IP-trained models (SASRec V10
+                            canonical), where popularity-aware magnitude is
+                            informative signal.
 
     Returns:
         Dict with keys: hr_10, ndcg_10, hr_20, ndcg_20, n_sessions,
@@ -677,7 +695,7 @@ def evaluate_sessions(
 
     # ── Step 3: FAISS index ───────────────────────────────────────────────
     _, item_idx_array, index = _build_item_faiss_index(
-        model, n_items, trained_item_idxs, device
+        model, n_items, trained_item_idxs, device, normalize=normalize,
     )
 
     # ── Step 4: Batch encode + retrieve ──────────────────────────────────
@@ -701,7 +719,8 @@ def evaluate_sessions(
 
             user_embs    = model.encode_sequence(item_batch, event_batch)
             user_embs_np = user_embs.detach().cpu().numpy().astype(np.float32)
-            faiss.normalize_L2(user_embs_np)
+            if normalize:
+                faiss.normalize_L2(user_embs_np)
 
             _, faiss_indices = index.search(user_embs_np, n_faiss_candidates)
 

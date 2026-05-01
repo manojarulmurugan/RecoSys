@@ -68,14 +68,15 @@ def get_param_groups(
 # ── Training loop ─────────────────────────────────────────────────────────────
 
 def train_epoch_sequence(
-    model:        SequenceModel,
-    dataloader:   DataLoader,
-    optimizer:    torch.optim.Optimizer,
-    neg_sampler:  UniformNegativeSampler,
-    device:       torch.device,
-    temperature:  float = 1.0,
-    grad_clip:    float | None = 1.0,
-    log_every:    int = 100,
+    model:          SequenceModel,
+    dataloader:     DataLoader,
+    optimizer:      torch.optim.Optimizer,
+    neg_sampler:    UniformNegativeSampler,
+    device:         torch.device,
+    temperature:    float = 1.0,
+    grad_clip:      float | None = 1.0,
+    log_every:      int = 100,
+    step_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
 ) -> float:
     """Run one epoch of sampled-softmax training.
 
@@ -160,6 +161,8 @@ def train_epoch_sequence(
                 max_norm = grad_clip,
             )
         optimizer.step()
+        if step_scheduler is not None:
+            step_scheduler.step()
 
         # Track epoch-level mean loss weighted by # of real positions.
         total_loss_weighted += float(loss.item()) * n_pos
@@ -181,6 +184,141 @@ def train_epoch_sequence(
     elapsed    = int(time.time() - t0)
     print(
         f"  epoch loss : {epoch_loss:.4f}  "
+        f"({n_pos_total:,} positions, {elapsed // 60}m {elapsed % 60}s)"
+    )
+    return epoch_loss
+
+
+# ── Canonical SASRec training loop (V10): gBCE + learnable scale ─────────────
+
+def train_epoch_sasrec(
+    model:          SequenceModel,
+    dataloader:     DataLoader,
+    optimizer:      torch.optim.Optimizer,
+    neg_sampler:    UniformNegativeSampler,
+    device:         torch.device,
+    t:              float = 0.75,
+    grad_clip:      float | None = 1.0,
+    log_every:      int = 200,
+    step_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+) -> float:
+    """One epoch of canonical SASRec training (gSASRec / RecSys 2023).
+
+    Differences from ``train_epoch_sequence`` (sampled softmax):
+      - Raw dot-product scoring (model outputs are NOT L2-normalised).
+      - Learnable scalar ``model.log_scale`` multiplies logits before the
+        BCE — replaces the fixed ``1/temperature`` knob.
+      - gBCE loss: standard BCE on negatives, calibrated BCE on positives
+        with calibration parameter ``t`` and exponent ``β`` derived from
+        the negative-sampling rate ``α = K / (n_items - 1)``:
+            β = α · (t · (1 − 1/α) + 1/α)
+        Numerically-stable form via ``F.logsigmoid`` and ``log1p``.
+
+    Why gBCE: independent positive/negative gradients (no softmax coupling),
+    proven at 100K+ catalog scale where uniform sampled-softmax is too easy
+    (random negatives dominated by long-tail items collapse to popularity
+    direction).  See asash/gSASRec-pytorch.
+
+    Args:
+        model:          SequenceModel exposing ``forward``, ``get_item_embeddings``,
+                        and a learnable ``log_scale`` ``nn.Parameter``.
+        dataloader:     Yields dicts with keys ``input_seq``, ``input_event_seq``,
+                        ``target_seq``, ``target_mask``.
+        optimizer:      AdamW.  Must include ``model.log_scale`` in its parameter
+                        groups (handled automatically by ``model.parameters()``).
+        neg_sampler:    Provides ``sample((B, L)) -> LongTensor (B, L, K)``.
+        device:         Torch device.
+        t:              gBCE calibration parameter in (0, 1].  ``t=1.0`` recovers
+                        standard BCE; lower ``t`` more aggressively up-weights
+                        positive gradients to compensate for the K-to-N sampling
+                        rate.  Default 0.75 from the gSASRec paper.
+        grad_clip:      Max global L2 grad norm.
+        log_every:      Print loss every N steps.
+        step_scheduler: Per-step LR scheduler (LambdaLR for warmup+cosine).
+
+    Returns:
+        Mean per-position gBCE loss over the epoch.
+    """
+    model.train()                                       # type: ignore[attr-defined]
+    total_loss_weighted = 0.0
+    n_pos_total         = 0
+    t0                  = time.time()
+    last_log_time       = t0
+
+    n_items = neg_sampler.n_items
+    K       = neg_sampler.n_neg
+    alpha   = K / max(n_items - 1, 1)
+    beta    = alpha * (t * (1.0 - 1.0 / alpha) + 1.0 / alpha)
+
+    for step, batch in enumerate(dataloader, start=1):
+        input_seq  = batch["input_seq"].to(device,        non_blocking=True)
+        event_seq  = batch["input_event_seq"].to(device,  non_blocking=True)
+        target_seq = batch["target_seq"].to(device,       non_blocking=True)
+        mask       = batch["target_mask"].to(device,      non_blocking=True)
+
+        n_pos = int(mask.sum().item())
+        if n_pos == 0:
+            continue
+
+        out       = model.forward(input_seq, event_seq)         # (B, L, D)
+        item_embs = model.get_item_embeddings()                 # (n_items, D)
+        scale     = model.log_scale.exp()                       # type: ignore[attr-defined]
+
+        pos_emb   = item_embs[target_seq]                       # (B, L, D)
+        pos_logit = scale * (out * pos_emb).sum(-1)             # (B, L)
+
+        neg_idx   = neg_sampler.sample(out.shape[:2])           # (B, L, K)
+        neg_emb   = item_embs[neg_idx]                          # (B, L, K, D)
+        neg_logit = scale * torch.einsum("bld,blkd->blk", out, neg_emb)
+
+        # gBCE positive: -log( σ(s⁺)**β / (1 - σ(s⁺)**β) )
+        log_sig_pos       = F.logsigmoid(pos_logit)             # (B, L)
+        log_pow_sig       = beta * log_sig_pos                  # log(σ**β)
+        # log(1 - σ**β); clamp keeps log1p input strictly < 0 for stability.
+        log_one_minus_pow = torch.log1p(
+            -torch.exp(log_pow_sig).clamp(max=1.0 - 1e-7)
+        )
+        loss_pos = -(log_pow_sig - log_one_minus_pow)           # (B, L)
+
+        # Standard BCE on negatives: -log σ(-s⁻)  summed over K.
+        loss_neg = -F.logsigmoid(-neg_logit).sum(-1)            # (B, L)
+
+        loss_per_pos = loss_pos + loss_neg                      # (B, L)
+        loss = (loss_per_pos * mask).sum() / mask.sum().clamp(min=1)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),                             # type: ignore[arg-type]
+                max_norm = grad_clip,
+            )
+        optimizer.step()
+        if step_scheduler is not None:
+            step_scheduler.step()
+
+        total_loss_weighted += float(loss.item()) * n_pos
+        n_pos_total         += n_pos
+
+        if log_every and step % log_every == 0:
+            now          = time.time()
+            running_loss = total_loss_weighted / max(n_pos_total, 1)
+            steps_per_s  = log_every / max(now - last_log_time, 1e-6)
+            cur_scale    = float(scale.item())
+            print(
+                f"    step {step:>5,}/{len(dataloader):,}  "
+                f"loss {running_loss:.4f}  "
+                f"scale {cur_scale:.3f}  "
+                f"({steps_per_s:.1f} steps/s)"
+            )
+            last_log_time = now
+
+    epoch_loss = total_loss_weighted / max(n_pos_total, 1)
+    elapsed    = int(time.time() - t0)
+    final_scale = float(model.log_scale.exp().item())           # type: ignore[attr-defined]
+    print(
+        f"  epoch loss : {epoch_loss:.4f}  "
+        f"scale {final_scale:.3f}  "
         f"({n_pos_total:,} positions, {elapsed // 60}m {elapsed % 60}s)"
     )
     return epoch_loss
