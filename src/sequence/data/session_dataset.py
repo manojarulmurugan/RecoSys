@@ -179,8 +179,15 @@ class SessionEvalDataset:
         self._target_items = np.zeros(n, dtype=np.int64)
 
         t0 = time.time()
-        prefix_item_arr  = np.full((n, max_seq_len), PAD_ITEM_IDX,  dtype=np.int64)
-        prefix_event_arr = np.full((n, max_seq_len), PAD_EVENT_IDX, dtype=np.int64)
+        # Prefix length MUST be max_seq_len-1 to match the training input length.
+        # SessionTrainDataset feeds input_seq = item_row[:-1] (length max_seq_len-1)
+        # to the model, so item D (second-to-last) always sits at position
+        # max_seq_len-2 with pos_emb[max_seq_len-2].  Padding the eval prefix to
+        # max_seq_len instead would shift D to position max_seq_len-1, giving it an
+        # OOD positional embedding and collapsing SASRec retrieval to 0 hits.
+        prefix_len = max_seq_len - 1
+        prefix_item_arr  = np.full((n, prefix_len), PAD_ITEM_IDX,  dtype=np.int64)
+        prefix_event_arr = np.full((n, prefix_len), PAD_EVENT_IDX, dtype=np.int64)
 
         for i, (items, events) in enumerate(zip(
             sessions_df["item_seq"].to_numpy(),
@@ -194,19 +201,19 @@ class SessionEvalDataset:
             prefix_items  = items_arr[:-1]
             prefix_events = events_arr[:-1]
 
-            if prefix_items.shape[0] > max_seq_len:
-                prefix_items  = prefix_items[-max_seq_len:]
-                prefix_events = prefix_events[-max_seq_len:]
+            if prefix_items.shape[0] > prefix_len:
+                prefix_items  = prefix_items[-prefix_len:]
+                prefix_events = prefix_events[-prefix_len:]
 
             L = prefix_items.shape[0]
             if L > 0:
-                prefix_item_arr [i, max_seq_len - L:] = prefix_items
-                prefix_event_arr[i, max_seq_len - L:] = prefix_events
+                prefix_item_arr [i, prefix_len - L:] = prefix_items
+                prefix_event_arr[i, prefix_len - L:] = prefix_events
 
         elapsed = time.time() - t0
         print(
             f"  SessionEvalDataset: {n:,} sessions, "
-            f"prefix shape ({n:,} x {max_seq_len}) in {elapsed:.1f}s"
+            f"prefix shape ({n:,} x {prefix_len}) in {elapsed:.1f}s"
         )
 
         self._prefix_item_arr  = prefix_item_arr
