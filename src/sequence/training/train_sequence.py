@@ -189,7 +189,7 @@ def train_epoch_sequence(
     return epoch_loss
 
 
-# ── Canonical SASRec training loop (V10): gBCE + learnable scale ─────────────
+# ── Canonical SASRec training loop (V10): sampled softmax CE on raw IP ───────
 
 def train_epoch_sasrec(
     model:          SequenceModel,
@@ -197,58 +197,55 @@ def train_epoch_sasrec(
     optimizer:      torch.optim.Optimizer,
     neg_sampler:    UniformNegativeSampler,
     device:         torch.device,
-    t:              float = 0.75,
+    temperature:    float = 1.0,
     grad_clip:      float | None = 1.0,
     log_every:      int = 200,
     step_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
 ) -> float:
-    """One epoch of canonical SASRec training (gSASRec / RecSys 2023).
+    """One epoch of canonical SASRec training (V10): sampled softmax CE on raw IP.
 
-    Differences from ``train_epoch_sequence`` (sampled softmax):
-      - Raw dot-product scoring (model outputs are NOT L2-normalised).
-      - Learnable scalar ``model.log_scale`` multiplies logits before the
-        BCE — replaces the fixed ``1/temperature`` knob.
-      - gBCE loss: standard BCE on negatives, calibrated BCE on positives
-        with calibration parameter ``t`` and exponent ``β`` derived from
-        the negative-sampling rate ``α = K / (n_items - 1)``:
-            β = α · (t · (1 − 1/α) + 1/α)
-        Numerically-stable form via ``F.logsigmoid`` and ``log1p``.
+    Approach follows eSASRec (Petrov & Macdonald 2024):
+      - Raw inner-product logits (encoder output is NOT L2-normalised).
+      - K uniform random negatives per (batch, position).
+      - Cross-entropy over (1 positive + K negative) logits, positive at col 0.
+      - Optional fixed temperature scaling.
 
-    Why gBCE: independent positive/negative gradients (no softmax coupling),
-    proven at 100K+ catalog scale where uniform sampled-softmax is too easy
-    (random negatives dominated by long-tail items collapse to popularity
-    direction).  See asash/gSASRec-pytorch.
+    Why sampled softmax CE replaced gBCE here:
+      gBCE summed K negative-loss terms vs a single β-weighted positive term.
+      At our 285K-item catalog with K=256, β ≈ 0.25 (gSASRec formula tuned for
+      ≤100K catalogs), producing a K/β ≈ 1024:1 gradient imbalance — the
+      model collapsed to neg_logit → -∞ while leaving positives at ≈-2.5
+      (true positives scored worse than random items, NDCG below pop).
+      Softmax CE pos/neg gradients sum to zero by construction, so the
+      imbalance never appears.  Wu et al. (TOIS 2024) prove sampled softmax
+      CE is a consistent estimator of full softmax under log-Q correction.
+
+    Why no learnable log_scale (still on model for backward compat with
+    earlier checkpoints / sanity checks):
+      With L2 norm gone, raw embedding magnitudes are free to grow; the
+      emergent natural scale plays the role a learnable scalar would, so
+      adding one is redundant and was a degenerate knob in earlier attempts.
 
     Args:
-        model:          SequenceModel exposing ``forward``, ``get_item_embeddings``,
-                        and a learnable ``log_scale`` ``nn.Parameter``.
-        dataloader:     Yields dicts with keys ``input_seq``, ``input_event_seq``,
-                        ``target_seq``, ``target_mask``.
-        optimizer:      AdamW.  Must include ``model.log_scale`` in its parameter
-                        groups (handled automatically by ``model.parameters()``).
+        model:          SequenceModel exposing ``forward`` + ``get_item_embeddings``.
+        dataloader:     Yields input_seq, input_event_seq, target_seq, target_mask.
+        optimizer:      AdamW.
         neg_sampler:    Provides ``sample((B, L)) -> LongTensor (B, L, K)``.
         device:         Torch device.
-        t:              gBCE calibration parameter in (0, 1].  ``t=1.0`` recovers
-                        standard BCE; lower ``t`` more aggressively up-weights
-                        positive gradients to compensate for the K-to-N sampling
-                        rate.  Default 0.75 from the gSASRec paper.
+        temperature:    Logit scaling.  Default 1.0 (raw IP).  Drop to 0.5 if
+                        logits explode and softmax saturates early in training.
         grad_clip:      Max global L2 grad norm.
         log_every:      Print loss every N steps.
-        step_scheduler: Per-step LR scheduler (LambdaLR for warmup+cosine).
+        step_scheduler: Per-step LR scheduler (warmup + cosine).
 
     Returns:
-        Mean per-position gBCE loss over the epoch.
+        Mean per-position cross-entropy loss over the epoch (PAD masked out).
     """
     model.train()                                       # type: ignore[attr-defined]
     total_loss_weighted = 0.0
     n_pos_total         = 0
     t0                  = time.time()
     last_log_time       = t0
-
-    n_items = neg_sampler.n_items
-    K       = neg_sampler.n_neg
-    alpha   = K / max(n_items - 1, 1)
-    beta    = alpha * (t * (1.0 - 1.0 / alpha) + 1.0 / alpha)
 
     for step, batch in enumerate(dataloader, start=1):
         input_seq  = batch["input_seq"].to(device,        non_blocking=True)
@@ -262,26 +259,24 @@ def train_epoch_sasrec(
 
         out       = model.forward(input_seq, event_seq)         # (B, L, D)
         item_embs = model.get_item_embeddings()                 # (n_items, D)
-        scale     = model.log_scale.exp()                       # type: ignore[attr-defined]
 
         pos_emb   = item_embs[target_seq]                       # (B, L, D)
-        pos_logit = scale * (out * pos_emb).sum(-1)             # (B, L)
+        pos_logit = (out * pos_emb).sum(-1) / temperature       # (B, L)
 
         neg_idx   = neg_sampler.sample(out.shape[:2])           # (B, L, K)
         neg_emb   = item_embs[neg_idx]                          # (B, L, K, D)
-        neg_logit = scale * torch.einsum("bld,blkd->blk", out, neg_emb)
+        neg_logit = torch.einsum("bld,blkd->blk", out, neg_emb) / temperature
 
-        # gBCE positive: BCE on the transformed logit γ(s) where σ(γ) = σ(s)**β.
-        # Algebra collapses this to -β · log σ(s) — bounded below by 0.
-        # Earlier "stable" form -log(σ**β) + log(1 - σ**β) had an unbounded
-        # sink as σ → 1 (loss → -∞), which the model exploited by inflating
-        # log_scale instead of ranking items.
-        loss_pos = -beta * F.logsigmoid(pos_logit)              # (B, L)
+        # Positive at column 0, K negatives after — standard sampled softmax CE.
+        logits = torch.cat([pos_logit.unsqueeze(-1), neg_logit], dim=-1)
+        labels = torch.zeros_like(target_seq)
 
-        # Standard BCE on negatives: -log σ(-s⁻)  summed over K.
-        loss_neg = -F.logsigmoid(-neg_logit).sum(-1)            # (B, L)
+        loss_per_pos = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
+            reduction = "none",
+        ).view_as(target_seq)                                              # (B, L)
 
-        loss_per_pos = loss_pos + loss_neg                      # (B, L)
         loss = (loss_per_pos * mask).sum() / mask.sum().clamp(min=1)
 
         optimizer.zero_grad(set_to_none=True)
@@ -302,21 +297,22 @@ def train_epoch_sasrec(
             now          = time.time()
             running_loss = total_loss_weighted / max(n_pos_total, 1)
             steps_per_s  = log_every / max(now - last_log_time, 1e-6)
-            cur_scale    = float(scale.item())
+            with torch.no_grad():
+                pos_sum  = (pos_logit * mask).sum().item()
+                pos_mean = pos_sum / max(float(mask.sum().item()), 1.0)
+                neg_mean = float(neg_logit.mean().item())
             print(
                 f"    step {step:>5,}/{len(dataloader):,}  "
                 f"loss {running_loss:.4f}  "
-                f"scale {cur_scale:.3f}  "
+                f"pos {pos_mean:+.2f}  neg {neg_mean:+.2f}  "
                 f"({steps_per_s:.1f} steps/s)"
             )
             last_log_time = now
 
     epoch_loss = total_loss_weighted / max(n_pos_total, 1)
     elapsed    = int(time.time() - t0)
-    final_scale = float(model.log_scale.exp().item())           # type: ignore[attr-defined]
     print(
         f"  epoch loss : {epoch_loss:.4f}  "
-        f"scale {final_scale:.3f}  "
         f"({n_pos_total:,} positions, {elapsed // 60}m {elapsed % 60}s)"
     )
     return epoch_loss

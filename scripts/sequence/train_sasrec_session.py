@@ -1,26 +1,29 @@
-"""SASRec session-based training -- V10 / canonical (gBCE + raw IP).
+"""SASRec session-based training -- V10 / canonical (sampled softmax CE + raw IP).
 
 Canonical SASRec scoring: raw dot product, no L2 normalisation.  Loss is
-gBCE (gSASRec, RecSys 2023): standard BCE on negatives + calibrated BCE on
-positives with calibration parameter t and exponent
+sampled softmax cross-entropy with K uniform random negatives per position
+(positive logit at column 0, K negatives after, label=0).  This is the
+loss recommended by eSASRec (Petrov & Macdonald 2024) and proven a
+consistent estimator of full softmax under log-Q correction by Wu et al.
+(TOIS 2024).
 
-    alpha = K / (n_items - 1)
-    beta  = alpha * (t * (1 - 1/alpha) + 1/alpha)
+WHY NOT gBCE / COSINE:
+Four earlier attempts on this dataset failed:
+  1. Full softmax + L2 norm + temp=0.07: NDCG=0.005 (attention rank-collapse
+     under L2 norm — encoder output near-constant across users).
+  2. Sampled softmax K=512 + L2 norm: NDCG=0.0006.  Cosine bound on logits
+     [-1, 1] gives a geometric loss floor of log(1+K/e)~5.24.
+  3. gBCE + raw IP + learnable log_scale (broken formula): loss diverged
+     to -infinity (positive-loss formula -log(σ^β) + log(1-σ^β) had an
+     unbounded sink as σ → 1).
+  4. gBCE + raw IP + corrected formula (-β·logsigmoid(pos)): loss decreased
+     but model collapsed to neg_logit → -inf with positives stuck at ≈-2.5.
+     Cause: K/β ≈ 1024:1 gradient imbalance at 285K-item scale (gSASRec's
+     β formula was tuned for ≤100K catalogs).
 
-A learnable scalar ``model.log_scale`` (NormFace) multiplies raw dot products
-before the BCE — replaces the fixed ``1/temperature`` knob and lets the model
-discover its own logit scale during warmup without coupling effective LR to
-the growth rate of embedding magnitudes.
-
-WHY NOT COSINE / TEMPERATURE:
-Earlier attempts (full softmax + temp=0.07; sampled softmax K=512 + temp=1.0)
-both produced HR/NDCG below the popularity baseline.  Diagnosis: the L2
-normalisation in ``SASRecModel.forward`` and ``get_item_embeddings`` bounded
-logits to [-1, 1], creating a sampled-softmax loss floor of log(1+K/e)~5.24
-that the model hit and never escaped.  Combined with the transformer rank-
-collapse failure mode (uniform attention -> constant output), the encoder
-output became near-constant across users.  Switching to canonical SASRec
-scoring (raw dot product) plus gBCE breaks both pathologies.
+Sampled softmax CE has pos/neg gradients that sum to zero by construction,
+so this imbalance never appears.  Combined with raw IP (no [-1,1] bound),
+both prior pathologies are eliminated.
 
 Outputs (all under --checkpoint-dir):
   best_checkpoint.pt    Best val-NDCG@20 checkpoint
@@ -33,7 +36,7 @@ Usage:
 
   With custom hyperparams:
     python scripts/sequence/train_sasrec_session.py \\
-        --n-neg 256 --t 0.75 --batch-size 128 --lr 3e-4
+        --n-neg 1024 --temperature 1.0 --batch-size 128 --lr 3e-4
 
   With MLflow (configure after Day 6):
     python scripts/sequence/train_sasrec_session.py \\
@@ -134,7 +137,7 @@ def _mlflow_end(run: Any) -> None:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="SASRec session training V10 (canonical: raw IP + gBCE + learnable scale)",
+        description="SASRec session training V10 (canonical: raw IP + sampled softmax CE)",
     )
     # Paths
     p.add_argument("--artifacts-dir",  default="artifacts/500k")
@@ -151,13 +154,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--epochs",       type=int,   default=30)
     p.add_argument("--batch-size",   type=int,   default=128,
                    help="128 for A100. Use 64 for V100/T4.")
-    p.add_argument("--n-neg",        type=int,   default=256,
+    p.add_argument("--n-neg",        type=int,   default=1024,
                    help="Uniform random negatives per (batch, position). "
-                        "gSASRec recommends K=256.")
-    p.add_argument("--t",            type=float, default=0.75,
-                   help="gBCE calibration parameter in (0, 1]. "
-                        "t=1.0 -> standard BCE; lower t up-weights positive "
-                        "gradients to compensate for K-to-N sampling rate.")
+                        "eSASRec recommends K>=256; K=1024 standard for "
+                        "100K+ catalogs.")
+    p.add_argument("--temperature",  type=float, default=1.0,
+                   help="Logit temperature for sampled softmax CE. "
+                        "Default 1.0 (raw IP). Drop to 0.5 if logits explode "
+                        "and softmax saturates early.")
     p.add_argument("--lr",           type=float, default=3e-4,
                    help="Peak LR reached after warmup.")
     p.add_argument("--lr-start",     type=float, default=1e-5,
@@ -197,7 +201,7 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    _section("SASRec Session Training V10 (canonical: raw IP + gBCE)")
+    _section("SASRec Session Training V10 (canonical: raw IP + sampled softmax CE)")
     print(f"  Device          : {device}")
     print(f"  Artifacts dir   : {artifacts_dir}")
     print(f"  Checkpoint dir  : {ckpt_dir}")
@@ -207,11 +211,11 @@ def main() -> None:
     print(f"  embed_dim       : {args.embed_dim}")
     print(f"  n_layers        : {args.n_layers}  (heads={args.n_heads}, ffn={args.ffn_dim})")
     print(f"  dropout         : {args.dropout}")
-    print(f"  n_neg           : {args.n_neg}  (gBCE negatives per position)")
-    print(f"  gBCE t          : {args.t}")
+    print(f"  n_neg           : {args.n_neg}  (sampled softmax CE negatives per position)")
+    print(f"  temperature     : {args.temperature}")
     print(f"  lr              : {args.lr}  (start={args.lr_start}, min={args.lr_min})")
     print(f"  warmup_steps    : {args.warmup_steps}")
-    print(f"  loss            : gbce_k{args.n_neg}")
+    print(f"  loss            : sampled_softmax_ce_k{args.n_neg}")
     print(f"  scoring         : raw inner product (no L2 normalisation)")
 
     # ── Load vocabs ───────────────────────────────────────────────────────
@@ -260,8 +264,6 @@ def main() -> None:
         dropout       = args.dropout,
     ).to(device)
     model.model_summary()
-    print(f"\n  log_scale init  : exp({model.log_scale.item():.3f}) "
-          f"= {model.log_scale.exp().item():.3f}")
 
     # Negative sampler lives on GPU so no host<->device copies in the hot loop.
     neg_sampler = UniformNegativeSampler(n_items=n_items, n_neg=args.n_neg, device=device)
@@ -290,15 +292,13 @@ def main() -> None:
         f"cosine -> {args.lr_min:.1e} over {total_steps:,} total steps"
     )
 
-    # gBCE beta for logging.
-    alpha = args.n_neg / max(n_items - 1, 1)
-    beta  = alpha * (args.t * (1.0 - 1.0 / alpha) + 1.0 / alpha)
-    print(f"  gBCE alpha = {alpha:.6f}, beta = {beta:.4f} (from t={args.t})")
+    # Initial sampled softmax CE loss is log(K+1).
+    print(f"  Initial loss expectation : log({args.n_neg}+1) = {math.log(args.n_neg + 1):.3f}")
 
     # ── Save hyperparameters ──────────────────────────────────────────────
     hparams: dict[str, Any] = {
         "model":          "SASRecModel",
-        "schema_version": "v10_session_gbce_canonical",
+        "schema_version": "v10_session_sampled_softmax_ce",
         "n_items":        n_items,
         "n_users":        n_users,
         "embed_dim":      args.embed_dim,
@@ -309,9 +309,7 @@ def main() -> None:
         "dropout":        args.dropout,
         "batch_size":     args.batch_size,
         "n_neg":          args.n_neg,
-        "gbce_t":         args.t,
-        "gbce_alpha":     alpha,
-        "gbce_beta":      beta,
+        "temperature":    args.temperature,
         "lr":             args.lr,
         "lr_start":       args.lr_start,
         "lr_min":         args.lr_min,
@@ -321,9 +319,8 @@ def main() -> None:
         "grad_clip":      args.grad_clip,
         "patience":       args.patience,
         "seed":           args.seed,
-        "loss":           f"gbce_k{args.n_neg}",
+        "loss":           f"sampled_softmax_ce_k{args.n_neg}",
         "scoring":        "raw_inner_product",
-        "log_scale_init": float(model.log_scale.item()),
         "started_at":     _now_iso(),
     }
     with open(ckpt_dir / "hparams.json", "w") as f:
@@ -356,7 +353,7 @@ def main() -> None:
             optimizer      = optimizer,
             neg_sampler    = neg_sampler,
             device         = device,
-            t              = args.t,
+            temperature    = args.temperature,
             grad_clip      = args.grad_clip,
             log_every      = 200,
             step_scheduler = step_scheduler,
@@ -384,7 +381,6 @@ def main() -> None:
 
         elapsed_epoch = time.time() - t_epoch
         is_best       = val_ndcg20 > best_val_ndcg20
-        cur_scale     = float(model.log_scale.exp().item())
 
         if is_best:
             best_val_ndcg20 = val_ndcg20
@@ -432,7 +428,6 @@ def main() -> None:
             "pop_val_hr_20":    round(val_metrics["pop_hr_20"],   4),
             "pop_val_ndcg_20":  round(val_metrics["pop_ndcg_20"], 4),
             "best_val_ndcg_20": round(best_val_ndcg20, 4),
-            "log_scale":        round(cur_scale, 4),
             "is_best":          is_best,
             "elapsed_s":        round(elapsed_epoch, 1),
             "timestamp":        _now_iso(),
@@ -447,12 +442,10 @@ def main() -> None:
             "val_ndcg_10": val_metrics["ndcg_10"],
             "val_hr_20":   val_metrics["hr_20"],
             "val_ndcg_20": val_ndcg20,
-            "log_scale":   cur_scale,
         }, step=epoch)
 
         current_lr = optimizer.param_groups[0]["lr"]
-        print(f"  LR at epoch end : {current_lr:.2e}   "
-              f"log_scale.exp() = {cur_scale:.3f}")
+        print(f"  LR at epoch end : {current_lr:.2e}")
 
         if patience_ctr >= args.patience:
             print(f"\n  Early stopping triggered after {epoch} epochs.")
@@ -466,15 +459,14 @@ def main() -> None:
     print(f"  Training log    : {log_path}")
     print()
     print("  Per-epoch summary:")
-    print(f"  {'epoch':>5}  {'train_loss':>10}  {'val_ndcg@20':>11}  {'scale':>6}  {'best':>6}")
-    print("  " + "-" * 48)
+    print(f"  {'epoch':>5}  {'train_loss':>10}  {'val_ndcg@20':>11}  {'best':>6}")
+    print("  " + "-" * 42)
     for row in training_log:
         marker = "  <--" if row["is_best"] else ""
         print(
             f"  {row['epoch']:>5}  "
             f"{row['train_loss']:>10.4f}  "
-            f"{row['val_ndcg_20']:>11.4f}  "
-            f"{row['log_scale']:>6.3f}"
+            f"{row['val_ndcg_20']:>11.4f}"
             f"{marker}"
         )
 
