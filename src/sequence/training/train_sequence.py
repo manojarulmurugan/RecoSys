@@ -271,14 +271,12 @@ def train_epoch_sasrec(
         neg_emb   = item_embs[neg_idx]                          # (B, L, K, D)
         neg_logit = scale * torch.einsum("bld,blkd->blk", out, neg_emb)
 
-        # gBCE positive: -log( σ(s⁺)**β / (1 - σ(s⁺)**β) )
-        log_sig_pos       = F.logsigmoid(pos_logit)             # (B, L)
-        log_pow_sig       = beta * log_sig_pos                  # log(σ**β)
-        # log(1 - σ**β); clamp keeps log1p input strictly < 0 for stability.
-        log_one_minus_pow = torch.log1p(
-            -torch.exp(log_pow_sig).clamp(max=1.0 - 1e-7)
-        )
-        loss_pos = -(log_pow_sig - log_one_minus_pow)           # (B, L)
+        # gBCE positive: BCE on the transformed logit γ(s) where σ(γ) = σ(s)**β.
+        # Algebra collapses this to -β · log σ(s) — bounded below by 0.
+        # Earlier "stable" form -log(σ**β) + log(1 - σ**β) had an unbounded
+        # sink as σ → 1 (loss → -∞), which the model exploited by inflating
+        # log_scale instead of ranking items.
+        loss_pos = -beta * F.logsigmoid(pos_logit)              # (B, L)
 
         # Standard BCE on negatives: -log σ(-s⁻)  summed over K.
         loss_neg = -F.logsigmoid(-neg_logit).sum(-1)            # (B, L)
