@@ -1,0 +1,20 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    mlflow==2.13.0 \
+    google-cloud-storage>=3.0.0 \
+    boto3>=1.34.0
+
+# MLflow uses boto3 for GCS artifact store via the gs:// scheme when
+# google-cloud-storage is present; no extra config needed.
+
+ENV PYTHONUNBUFFERED=1
+ENV MLFLOW_ARTIFACT_ROOT=gs://recosys-mlflow-artifacts/
+
+CMD ["mlflow", "server", \
+     "--host", "0.0.0.0", \
+     "--port", "8080", \
+     "--backend-store-uri", "sqlite:////tmp/mlruns.db", \
+     "--default-artifact-root", "gs://recosys-mlflow-artifacts/"]
