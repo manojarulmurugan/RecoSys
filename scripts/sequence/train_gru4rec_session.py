@@ -52,6 +52,81 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from src.sequence.data.session_dataset import SessionEvalDataset, SessionTrainDataset
+
+
+# ── GCS helpers (used when running on Vertex AI) ───────────────────────────────
+
+def _ensure_gcp_credentials() -> None:
+    existing = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if existing and pathlib.Path(existing).expanduser().is_file():
+        return
+    for candidate in (
+        _REPO_ROOT / "secrets" / "recosys-service-account.json",
+        _REPO_ROOT / "recosys-service-account.json",
+        pathlib.Path.home() / "secrets" / "recosys-service-account.json",
+    ):
+        if candidate.is_file():
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(candidate.resolve())
+            return
+
+
+def _maybe_download_gcs_artifacts(artifacts_dir_str: str) -> pathlib.Path:
+    """If artifacts_dir is a gs:// path, download required files to /tmp/ and return that path.
+
+    On Vertex AI there is no local copy of the data — ADC provides auth automatically.
+    For local runs with a gs:// path, GOOGLE_APPLICATION_CREDENTIALS must be set.
+    If artifacts_dir is a local path, returns _REPO_ROOT / artifacts_dir_str unchanged.
+    """
+    if not artifacts_dir_str.startswith("gs://"):
+        return _REPO_ROOT / artifacts_dir_str
+
+    from google.cloud import storage as gcs_storage
+
+    local_dir = pathlib.Path("/tmp/gru4rec_artifacts")
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    # Parse gs://bucket/prefix
+    without_scheme = artifacts_dir_str[5:]
+    bucket_name, prefix = without_scheme.split("/", 1)
+    prefix = prefix.rstrip("/")
+
+    client = gcs_storage.Client()
+    bucket = client.bucket(bucket_name)
+
+    files_needed = [
+        f"{prefix}/vocabs.pkl",
+        f"{prefix}/sequences_v2/train_sessions.parquet",
+        f"{prefix}/sequences_v2/val_sessions.parquet",
+        f"{prefix}/sequences_v2/metadata.json",
+    ]
+    for blob_name in files_needed:
+        rel = blob_name[len(prefix) + 1:]
+        local_path = local_dir / rel
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        if not local_path.exists():
+            print(f"  [GCS] downloading {blob_name} -> {local_path}")
+            bucket.blob(blob_name).download_to_filename(str(local_path))
+        else:
+            print(f"  [GCS] cached     {local_path}")
+
+    return local_dir
+
+
+def _gcs_checkpoint_upload(local_path: pathlib.Path, gcs_ckpt_dir: str | None) -> None:
+    """Upload a checkpoint file to GCS after torch.save() (no-op for local runs)."""
+    if not gcs_ckpt_dir or not gcs_ckpt_dir.startswith("gs://"):
+        return
+    try:
+        from google.cloud import storage as gcs_storage
+        without_scheme = gcs_ckpt_dir[5:]
+        bucket_name, prefix = without_scheme.split("/", 1)
+        prefix = prefix.rstrip("/")
+        client = gcs_storage.Client()
+        blob_name = f"{prefix}/{local_path.name}"
+        client.bucket(bucket_name).blob(blob_name).upload_from_filename(str(local_path))
+        print(f"  [GCS] uploaded   {local_path.name} -> gs://{bucket_name}/{blob_name}")
+    except Exception as exc:
+        print(f"  [GCS] upload failed for {local_path.name}: {exc}")
 from src.sequence.evaluation.evaluate_sequence import evaluate_sessions
 from src.sequence.models.gru4rec import GRU4RecModel
 from src.sequence.training.train_sequence import get_param_groups, train_epoch_session
@@ -167,17 +242,29 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
 
+    _ensure_gcp_credentials()
+
     # ── Reproducibility ───────────────────────────────────────────────────
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     # ── Paths ─────────────────────────────────────────────────────────────
-    artifacts_dir = _REPO_ROOT / args.artifacts_dir
+    # Download from GCS to /tmp/ when running on Vertex AI (gs:// prefix);
+    # behaves identically to before for local paths.
+    artifacts_dir = _maybe_download_gcs_artifacts(args.artifacts_dir)
     seq_dir       = artifacts_dir / "sequences_v2"
-    ckpt_dir      = (
-        pathlib.Path(args.checkpoint_dir) if args.checkpoint_dir
-        else seq_dir / "checkpoints_v9_gru4rec_session"
-    )
+
+    # _gcs_ckpt_dir holds the original gs:// target for post-save uploads.
+    # Local ckpt_dir is /tmp/ when targeting GCS, otherwise local as before.
+    _gcs_ckpt_dir: str | None = None
+    if args.checkpoint_dir and args.checkpoint_dir.startswith("gs://"):
+        _gcs_ckpt_dir = args.checkpoint_dir
+        ckpt_dir = pathlib.Path("/tmp/gru4rec_checkpoints")
+    else:
+        ckpt_dir = (
+            pathlib.Path(args.checkpoint_dir) if args.checkpoint_dir
+            else seq_dir / "checkpoints_v9_gru4rec_session"
+        )
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -283,6 +370,7 @@ def main() -> None:
     with open(ckpt_dir / "hparams.json", "w") as f:
         json.dump(hparams, f, indent=2)
     print(f"\n  hparams.json -> {ckpt_dir / 'hparams.json'}")
+    _gcs_checkpoint_upload(ckpt_dir / "hparams.json", _gcs_ckpt_dir)
 
     # ── MLflow ────────────────────────────────────────────────────────────
     mlflow_run = _mlflow_start(args.mlflow_tracking_uri, args.run_name)
@@ -355,6 +443,7 @@ def main() -> None:
                 best_path,
             )
             print(f"  [NEW BEST]  val NDCG@20 = {val_ndcg20:.4f}  -> {best_path.name}")
+            _gcs_checkpoint_upload(best_path, _gcs_ckpt_dir)
         else:
             patience_ctr += 1
             print(
@@ -374,6 +463,7 @@ def main() -> None:
             },
             latest_path,
         )
+        _gcs_checkpoint_upload(latest_path, _gcs_ckpt_dir)
 
         # ── Epoch log ──────────────────────────────────────────────────
         epoch_entry: dict[str, Any] = {
@@ -397,6 +487,7 @@ def main() -> None:
         training_log.append(epoch_entry)
         with open(log_path, "w") as f:
             json.dump(training_log, f, indent=2)
+        _gcs_checkpoint_upload(log_path, _gcs_ckpt_dir)
 
         _mlflow_log_metrics(mlflow_run, {
             "train_loss":   train_loss,
