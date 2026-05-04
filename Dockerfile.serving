@@ -1,0 +1,33 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps needed by faiss-cpu
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# CPU-only PyTorch first (saves ~1 GB vs the default CUDA wheel)
+RUN pip install --no-cache-dir \
+    torch==2.1.0+cpu \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# faiss-cpu 1.7.4 was compiled against NumPy 1.x — pin numpy<2 to avoid ABI crash
+RUN pip install --no-cache-dir \
+    "numpy>=1.24.0,<2.0.0" \
+    faiss-cpu==1.7.4 \
+    fastapi>=0.110.0 \
+    "uvicorn[standard]>=0.27.0" \
+    google-cloud-storage>=3.0.0 \
+    pydantic>=2.0.0
+
+# Bake 110MB stripped inference checkpoint + 21MB vocabs into image.
+# Eliminates GCS download at runtime — startup takes ~5s instead of 60s+.
+COPY model/model_inference.pt model/model_inference.pt
+COPY model/vocabs.pkl         model/vocabs.pkl
+
+COPY src/ src/
+
+ENV PYTHONUNBUFFERED=1
+
+CMD ["uvicorn", "src.serving.app:app", "--host", "0.0.0.0", "--port", "8080"]

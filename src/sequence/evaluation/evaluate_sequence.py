@@ -33,6 +33,8 @@ Two public functions:
 
 from __future__ import annotations
 
+import itertools
+import time
 from typing import Any, Protocol
 
 import faiss
@@ -141,11 +143,19 @@ def _build_item_faiss_index(
     n_items:           int,
     trained_item_idxs: set | np.ndarray | None,
     device:            torch.device,
+    normalize:         bool = True,
 ) -> tuple[np.ndarray, np.ndarray, faiss.Index]:
     """Build a FAISS IndexFlatIP over trained item embeddings.
 
+    Args:
+        normalize: If True (default), L2-normalise embeddings before adding
+                   to the index — turns IP into cosine similarity.  Required
+                   for models trained under cosine (GRU4Rec V9).  Set False
+                   for models trained under raw dot product (SASRec V10
+                   canonical), where popularity-aware magnitude is signal.
+
     Returns:
-        embeddings:      (n_indexed, D) float32, L2-normalised.
+        embeddings:      (n_indexed, D) float32; L2-normalised iff ``normalize``.
         item_idx_array:  (n_indexed,)   int64 — item_idx per row.
         index:           Ready FAISS index.
     """
@@ -170,13 +180,14 @@ def _build_item_faiss_index(
 
     item_idx_array = np.where(keep_mask)[0].astype(np.int64)
     embeddings     = all_embs[item_idx_array].copy()
-    faiss.normalize_L2(embeddings)
+    if normalize:
+        faiss.normalize_L2(embeddings)
 
     index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
     print(
         f"  FAISS index : {embeddings.shape[0]:,} items × {embeddings.shape[1]} dims "
-        f"(filtered from {n_items:,} catalog items)"
+        f"(filtered from {n_items:,} catalog items, normalize={normalize})"
     )
     return embeddings, item_idx_array, index
 
@@ -195,6 +206,7 @@ def _retrieve_recommendations(
     batch_size:          int,
     n_faiss_candidates:  int,
     filter_seen:         bool,
+    normalize:           bool = True,
 ) -> dict[int, list[int]]:
     """Encode users, run FAISS, and return per-user top-20 item_idx lists.
 
@@ -222,7 +234,8 @@ def _retrieve_recommendations(
 
             user_embs    = model.encode_sequence(item_batch, event_batch)
             user_embs_np = user_embs.detach().cpu().numpy().astype(np.float32)
-            faiss.normalize_L2(user_embs_np)
+            if normalize:
+                faiss.normalize_L2(user_embs_np)
 
             _, faiss_indices = index.search(user_embs_np, n_faiss_candidates)
 
@@ -559,3 +572,200 @@ def evaluate_sequence_stratified(
 
     print(f"  {sep}")
     return results
+
+
+# ── Session-based evaluation (V9 / T4Rec §4.1.3) ─────────────────────────────
+
+def _session_metrics_from_recs(
+    recs: list[int],
+    target: int,
+    ks: tuple[int, ...] = (10, 20),
+) -> dict[str, float]:
+    """HR@K and NDCG@K for a single session with a single-item GT."""
+    result: dict[str, float] = {}
+    for k in ks:
+        top_k = recs[:k]
+        if target in top_k:
+            rank = top_k.index(target)
+            result[f"hr_{k}"]   = 1.0
+            result[f"ndcg_{k}"] = 1.0 / np.log2(rank + 2)
+        else:
+            result[f"hr_{k}"]   = 0.0
+            result[f"ndcg_{k}"] = 0.0
+    return result
+
+
+def evaluate_sessions(
+    model:               SequenceModel,
+    prefix_item_arr:     np.ndarray,
+    prefix_event_arr:    np.ndarray,
+    target_items:        np.ndarray,
+    train_sessions_df:   pd.DataFrame,
+    n_items:             int,
+    device:              torch.device,
+    batch_size:          int = 512,
+    n_faiss_candidates:  int = 50,
+    label:               str = "test",
+    normalize:           bool = True,
+) -> dict[str, Any]:
+    """Session-based next-item-prediction evaluation (T4Rec §4.1.3 protocol).
+
+    Ground truth: the last item of each session (single-item GT, no filter_seen).
+
+    Also computes a global-popularity baseline (item frequency in training
+    sessions) so the model result can be calibrated against chance.
+
+    Args:
+        model:              Sequence model with ``encode_sequence`` +
+                            ``get_item_embeddings``.
+        prefix_item_arr:    (n_sessions, max_seq_len) int64 — left-padded
+                            session prefixes (all-but-last item per session).
+        prefix_event_arr:   (n_sessions, max_seq_len) int64 — event prefixes.
+        target_items:       (n_sessions,) int64 — held-out last item per session.
+        train_sessions_df:  Sessions used in training (must have column
+                            ``item_seq``).  Used to derive the FAISS item
+                            universe and the popularity baseline.
+        n_items:            Catalog size including PAD token 0.
+        device:             Torch device for inference.
+        batch_size:         Sessions per forward-pass + FAISS batch.
+        n_faiss_candidates: Top-N retrieved from FAISS per session.
+                            Must be ≥ 20 for HR@20 / NDCG@20 to be meaningful.
+        label:              Short tag for printed headers.
+        normalize:          If True (default), L2-normalise FAISS index payload
+                            and query embeddings — turns IP into cosine.
+                            Required for cosine-trained models (GRU4Rec V9).
+                            Set False for raw-IP-trained models (SASRec V10
+                            canonical), where popularity-aware magnitude is
+                            informative signal.
+
+    Returns:
+        Dict with keys: hr_10, ndcg_10, hr_20, ndcg_20, n_sessions,
+        pop_hr_10, pop_ndcg_10, pop_hr_20, pop_ndcg_20.
+    """
+    print(f"\n  ── {label.upper()} SESSION EVALUATION (T4Rec protocol, no filter_seen) ──")
+    n_sessions = prefix_item_arr.shape[0]
+    if n_sessions != len(target_items):
+        raise ValueError(
+            f"prefix_item_arr has {n_sessions} rows but "
+            f"target_items has {len(target_items)} — must match."
+        )
+    print(f"  Sessions to evaluate : {n_sessions:,}")
+
+    # ── Step 1: Item universe + popularity counts from training sessions ──
+    t0 = time.time()
+    all_items = list(itertools.chain.from_iterable(
+        train_sessions_df["item_seq"].tolist()
+    ))
+    item_pop = pd.Series(all_items).value_counts()
+    item_pop = item_pop[item_pop.index != 0]       # exclude PAD token
+    trained_item_idxs = set(item_pop.index.tolist())
+    print(
+        f"  Train item universe  : {len(trained_item_idxs):,} items "
+        f"({time.time() - t0:.1f}s)"
+    )
+
+    # ── Step 2: Popularity baseline (pre-ranked list, O(1) lookup) ────────
+    top_pop_list = item_pop.index.to_numpy(dtype=np.int64).tolist()
+    pop_rank_10  = {item: rank for rank, item in enumerate(top_pop_list[:10])}
+    pop_rank_20  = {item: rank for rank, item in enumerate(top_pop_list[:20])}
+
+    pop_hr10   = np.zeros(n_sessions, dtype=np.float32)
+    pop_ndcg10 = np.zeros(n_sessions, dtype=np.float32)
+    pop_hr20   = np.zeros(n_sessions, dtype=np.float32)
+    pop_ndcg20 = np.zeros(n_sessions, dtype=np.float32)
+
+    for i, tgt in enumerate(target_items):
+        t = int(tgt)
+        if t in pop_rank_10:
+            pop_hr10  [i] = 1.0
+            pop_ndcg10[i] = 1.0 / np.log2(pop_rank_10[t] + 2)
+        if t in pop_rank_20:
+            pop_hr20  [i] = 1.0
+            pop_ndcg20[i] = 1.0 / np.log2(pop_rank_20[t] + 2)
+
+    mean_pop_hr10   = float(pop_hr10.mean())
+    mean_pop_ndcg10 = float(pop_ndcg10.mean())
+    mean_pop_hr20   = float(pop_hr20.mean())
+    mean_pop_ndcg20 = float(pop_ndcg20.mean())
+    print(
+        f"  Pop baseline : "
+        f"HR@10={mean_pop_hr10:.4f}  NDCG@10={mean_pop_ndcg10:.4f}  "
+        f"HR@20={mean_pop_hr20:.4f}  NDCG@20={mean_pop_ndcg20:.4f}"
+    )
+
+    # ── Step 3: FAISS index ───────────────────────────────────────────────
+    _, item_idx_array, index = _build_item_faiss_index(
+        model, n_items, trained_item_idxs, device, normalize=normalize,
+    )
+
+    # ── Step 4: Batch encode + retrieve ──────────────────────────────────
+    t0 = time.time()
+    hr10_arr   = np.zeros(n_sessions, dtype=np.float32)
+    ndcg10_arr = np.zeros(n_sessions, dtype=np.float32)
+    hr20_arr   = np.zeros(n_sessions, dtype=np.float32)
+    ndcg20_arr = np.zeros(n_sessions, dtype=np.float32)
+
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, n_sessions, batch_size):
+            end = min(start + batch_size, n_sessions)
+
+            item_batch  = torch.tensor(
+                prefix_item_arr [start:end], dtype=torch.long, device=device
+            )
+            event_batch = torch.tensor(
+                prefix_event_arr[start:end], dtype=torch.long, device=device
+            )
+
+            user_embs    = model.encode_sequence(item_batch, event_batch)
+            user_embs_np = user_embs.detach().cpu().numpy().astype(np.float32)
+            if normalize:
+                faiss.normalize_L2(user_embs_np)
+
+            _, faiss_indices = index.search(user_embs_np, n_faiss_candidates)
+
+            for i in range(end - start):
+                recs = [
+                    int(item_idx_array[pos])
+                    for pos in faiss_indices[i]
+                    if pos >= 0
+                ]
+                tgt = int(target_items[start + i])
+                m   = _session_metrics_from_recs(recs, tgt, ks=(10, 20))
+                hr10_arr  [start + i] = m["hr_10"]
+                ndcg10_arr[start + i] = m["ndcg_10"]
+                hr20_arr  [start + i] = m["hr_20"]
+                ndcg20_arr[start + i] = m["ndcg_20"]
+
+    elapsed = int(time.time() - t0)
+    print(f"  Model encode+retrieve : {elapsed // 60}m {elapsed % 60}s")
+
+    mean_hr10   = float(hr10_arr.mean())
+    mean_ndcg10 = float(ndcg10_arr.mean())
+    mean_hr20   = float(hr20_arr.mean())
+    mean_ndcg20 = float(ndcg20_arr.mean())
+
+    sep = "═" * 56
+    print(f"\n  {sep}")
+    print(f"  {label.upper()} SESSION RESULTS")
+    print(f"  {sep}")
+    print(f"  {'Sessions':<18}: {n_sessions:,}")
+    print(f"  {'HR@10':<18}: {mean_hr10:.4f}   (pop: {mean_pop_hr10:.4f})")
+    print(f"  {'NDCG@10':<18}: {mean_ndcg10:.4f}   (pop: {mean_pop_ndcg10:.4f})")
+    print(f"  {'HR@20':<18}: {mean_hr20:.4f}   (pop: {mean_pop_hr20:.4f})")
+    print(f"  {'NDCG@20':<18}: {mean_ndcg20:.4f}   (pop: {mean_pop_ndcg20:.4f})")
+    print(f"  {sep}")
+    print(f"  T4Rec targets : GRU4Rec HR@20≈0.44, NDCG@20≈0.22")
+    print(f"  {sep}")
+
+    return {
+        "hr_10":        mean_hr10,
+        "ndcg_10":      mean_ndcg10,
+        "hr_20":        mean_hr20,
+        "ndcg_20":      mean_ndcg20,
+        "n_sessions":   n_sessions,
+        "pop_hr_10":    mean_pop_hr10,
+        "pop_ndcg_10":  mean_pop_ndcg10,
+        "pop_hr_20":    mean_pop_hr20,
+        "pop_ndcg_20":  mean_pop_ndcg20,
+    }

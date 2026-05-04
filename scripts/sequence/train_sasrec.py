@@ -136,7 +136,9 @@ WEIGHT_DECAY    = 1e-5
 N_NEG_SAMPLES   = 512
 N_EPOCHS        = 30
 EVAL_EVERY      = 5
-TEMPERATURE     = 0.07  # lower temp → sharper distribution → forces model to discriminate
+TEMPERATURE     = 0.20  # T=0.07 was too sharp: model over-personalised and scored below
+                        # Global Popularity.  T=0.20 keeps strong gradients while letting
+                        # some popularity signal survive in the embedding space.
 NUM_WORKERS     = 4
 GRAD_CLIP       = 1.0
 
@@ -328,7 +330,9 @@ def main() -> None:
         training_log = []
 
     # ── Training loop ─────────────────────────────────────────────────────
-    losses: list[float] = []
+    losses:    list[float] = []
+    best_r10:  float       = 0.0
+    best_epoch: int        = 0
     print()
     print(f"Training on {DEVICE} — {args.epochs} epochs total "
           f"(starting at epoch {start_epoch})")
@@ -378,15 +382,47 @@ def main() -> None:
             ckpt_path,
         )
 
-        # Log train loss every epoch (no val set — training on full Jan data).
-        log_entry = {
+        # Periodic evaluation on the Feb test set (same protocol as V1–V6).
+        # This is the only available clean eval window when training on
+        # full_train_seqs (Oct–Jan).  filter_seen=True matches V1–V6.
+        log_entry: dict = {
             "epoch":      epoch,
             "train_loss": round(epoch_loss, 6),
             "lr":         round(current_lr, 8),
         }
+        if epoch % EVAL_EVERY == 0:
+            print(f"\n  --- Test eval at epoch {epoch} ---")
+            ep_metrics = evaluate_sequence(
+                model              = model,
+                item_seq_arr       = test_eval.item_seq_arr,
+                event_seq_arr      = test_eval.event_seq_arr,
+                eval_targets_df    = test_targets_df,
+                train_pairs_df     = train_pairs,
+                n_items            = n_items_total,
+                device             = DEVICE,
+                batch_size         = 512,
+                n_faiss_candidates = 400,
+                label              = f"test (epoch {epoch})",
+                filter_seen        = True,
+            )
+            log_entry["test_recall_10"] = round(ep_metrics["recall_10"], 6)
+            log_entry["test_ndcg_10"]   = round(ep_metrics["ndcg_10"],   6)
+            log_entry["test_recall_20"] = round(ep_metrics["recall_20"], 6)
+            log_entry["test_ndcg_20"]   = round(ep_metrics["ndcg_20"],   6)
+
+            # Keep a copy of the best checkpoint by R@10.
+            if ep_metrics["recall_10"] > best_r10:
+                best_r10   = ep_metrics["recall_10"]
+                best_epoch = epoch
+                best_path  = CHECKPOINT_DIR / "best_recall10.pt"
+                import shutil
+                shutil.copy2(ckpt_path, best_path)
+                print(f"  ★ New best R@10 = {best_r10:.4f}  → saved best_recall10.pt")
+
         training_log.append(log_entry)
         with open(log_path, "w") as f:
             json.dump(training_log, f, indent=2)
+        print(f"  training_log.json updated ({len(training_log)} entries)")
 
     # ── Final test evaluation ─────────────────────────────────────────────
     # filter_seen=True: mirrors V1–V6 so test numbers are directly comparable.
@@ -400,7 +436,7 @@ def main() -> None:
         n_items            = n_items_total,
         device             = DEVICE,
         batch_size         = 512,
-        n_faiss_candidates = 200,
+        n_faiss_candidates = 400,
         label              = "test (final)",
         filter_seen        = True,
     )
@@ -413,7 +449,7 @@ def main() -> None:
         n_items            = n_items_total,
         device             = DEVICE,
         batch_size         = 512,
-        n_faiss_candidates = 200,
+        n_faiss_candidates = 400,
         label              = "test (final)",
         filter_seen        = True,
     )
@@ -434,13 +470,14 @@ def main() -> None:
     print(f"\n  → {CHECKPOINT_DIR / 'final_test_results.json'}")
 
     # ── Summary ───────────────────────────────────────────────────────────
-    if losses:
-        best_epoch = int(np.argmin(losses)) + start_epoch
-        best_loss  = float(min(losses))
-        _section("V8 training complete")
-        print(f"  Best train loss : {best_loss:.4f}  (epoch {best_epoch})")
+    best_loss_epoch = int(np.argmin(losses)) + start_epoch
+    best_loss       = float(min(losses))
+    _section("V8 training complete")
+    print(f"  Best train loss : {best_loss:.4f}  (epoch {best_loss_epoch})")
+    print(f"  Best R@10 epoch : {best_epoch}  ({best_r10:.4f})")
     print(f"  Final test R@10 : {test_metrics['recall_10']:.4f}")
     print(f"  Final test N@10 : {test_metrics['ndcg_10']:.4f}")
+    print(f"  Best checkpoint : {CHECKPOINT_DIR / 'best_recall10.pt'}")
     print(f"  Checkpoints     : {CHECKPOINT_DIR}")
     print(f"  Training log    : {log_path}")
 

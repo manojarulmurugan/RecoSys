@@ -1,0 +1,42 @@
+workerPoolSpecs:
+  - machineSpec:
+      machineType: a2-highgpu-1g
+      acceleratorType: NVIDIA_TESLA_A100
+      acceleratorCount: 1
+    replicaCount: 1
+    containerSpec:
+      imageUri: us-central1-docker.pkg.dev/recosys-489001/recosys-images/gru4rec:v9
+      args:
+        - --artifacts-dir
+        - gs://recosys-data-bucket/data/1M
+        - --checkpoint-dir
+        - gs://recosys-data-bucket/models/gru4rec_session_v9_1M
+        - --batch-size
+        - "256"
+        - --epochs
+        - "30"
+        - --patience
+        - "5"
+        - --embed-dim
+        - "128"
+        - --gru-hidden
+        - "256"
+        - --n-layers
+        - "1"
+        - --lr
+        - "3e-4"
+        - --temperature
+        - "0.07"
+        - --label-smoothing
+        - "0.1"
+        - --weight-decay
+        - "1e-5"
+        - --grad-clip
+        - "1.0"
+        - --seed
+        - "42"
+        - --run-name
+        - gru4rec_session_v9_1m
+      env:
+        - name: PYTHONUNBUFFERED
+          value: "1"

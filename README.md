@@ -1,20 +1,49 @@
 # RecoSys
 
-An end-to-end personalized recommendation engine built on the REES46 eCommerce clickstream dataset (Oct 2019 – Feb 2020, ~280 M events). The project runs entirely on Google Cloud Platform — raw data in GCS, processing in BigQuery and Dataproc/Spark, and model artefacts back to GCS.
+An end-to-end ML portfolio project — session-based recommendation engine on the REES46
+eCommerce clickstream dataset (Oct 2019 – Feb 2020, ~280 M events). Covers the full
+MLOps stack: BigQuery → Spark → GRU4Rec → Vertex AI → Cloud Run → MLflow → drift monitoring.
+
+---
+
+## Results
+
+| Metric | Value | T4Rec Target | Baseline (popularity) |
+|---|---|---|---|
+| NDCG@20 | **0.2676** | ≥ 0.22 ✓ | 0.0353 |
+| HR@20 | **0.4815** | ≥ 0.44 ✓ | 0.0806 |
+| vs. T4Rec XLNet (best published) | +5.1% NDCG@20 | — | — |
+
+Model: GRU4Rec V9 with event-type features, trained on 1M-user REES46 sample on Vertex AI (A100 GPU, 10h 46m).
+
+**Live demo (PowerShell):**
+```powershell
+# Health
+Invoke-RestMethod "$SERVICE_URL/health" | ConvertTo-Json
+
+# Recommendations
+$body = '{"session":[{"item_id":"4209538","event_type":"view"},{"item_id":"3622698","event_type":"cart"}],"top_k":20}'
+Invoke-RestMethod -Method Post "$SERVICE_URL/recommend" -ContentType "application/json" -Body $body | ConvertTo-Json
+```
 
 ---
 
 ## Project status
 
-| Phase | Description | Status |
+| Day | Description | Status |
 |---|---|---|
 | 1 | Data ingestion — raw CSVs → GCS → BigQuery | ✅ Complete |
 | 2 | Exploratory data analysis (BigQuery + Spark) | ✅ Complete |
 | 3 | Spark preprocessing pipeline (Dataproc) | ✅ Complete |
 | 4 | Sampling, temporal splits, interaction tables | ✅ Complete |
-| 5 | Two-Tower model — 50k experiments complete | ✅ Complete |
-| 6 | Two-Tower model — 500k GPU training | 🔲 Next |
-| 7 | Evaluation and serving | 🔲 Planned |
+| 1–4 | Two-Tower V1–V6 + GRU4Rec V7 + SASRec V8 (all below pop baseline) | ✅ Complete |
+| 4 | GRU4Rec V9 session-based — 500k — NDCG@20=0.2606 | ✅ Complete |
+| 5 | 1M-user sample creation (890,736 users, 222,864 items) | ✅ Complete |
+| 6–7 | Vertex AI training on 1M sample — NDCG@20=0.2676 | ✅ Complete |
+| 8–9 | Cloud Run serving (FastAPI + FAISS) | 🔲 In progress |
+| 10–11 | MLflow experiment tracking | 🔲 In progress |
+| 12–13 | Distribution drift monitoring (COVID-period shift) | 🔲 In progress |
+| 14 | End-to-end demo | 🔲 In progress |
 
 ---
 
