@@ -23,8 +23,11 @@ RUN pip install --no-cache-dir \
 
 # Bake 110MB stripped inference checkpoint + 21MB vocabs into image.
 # Eliminates GCS download at runtime — startup takes ~5s instead of 60s+.
+RUN pip install --no-cache-dir slowapi>=0.1.9 "limits>=3.0.0"
+
 COPY model/model_inference.pt model/model_inference.pt
 COPY model/vocabs.pkl         model/vocabs.pkl
+COPY reports/drift_report.json /app/drift_report.json
 
 COPY src/ src/
 
