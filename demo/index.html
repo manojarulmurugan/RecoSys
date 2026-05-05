@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RecoSys — GRU4Rec Session Recommender</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    * { font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+    body { background: #07090f; }
+
+    .badge-view     { background: rgba(59,130,246,0.12); color: #60a5fa; border: 1px solid rgba(59,130,246,0.25); }
+    .badge-cart     { background: rgba(245,158,11,0.12); color: #fbbf24; border: 1px solid rgba(245,158,11,0.25); }
+    .badge-purchase { background: rgba(16,185,129,0.12); color: #34d399; border: 1px solid rgba(16,185,129,0.25); }
+
+    .card { background: rgba(15,20,35,0.9); border: 1px solid rgba(255,255,255,0.07); border-radius: 12px; }
+    .btn-primary { background: #2563eb; transition: background 0.15s; }
+    .btn-primary:hover { background: #3b82f6; }
+    .btn-primary:disabled { background: #1e3a6e; color: #4b5563; cursor: not-allowed; }
+
+    .rec-row { border-radius: 6px; transition: background 0.1s; }
+    .rec-row:hover { background: rgba(255,255,255,0.03); }
+
+    @keyframes shimmer { 0%,100%{opacity:0.4} 50%{opacity:1} }
+    .shimmer { animation: shimmer 1.4s ease-in-out infinite; }
+  </style>
+</head>
+<body class="text-gray-100 min-h-screen">
+
+  <!-- ── Header ── -->
+  <header style="border-bottom: 1px solid rgba(255,255,255,0.06);" class="px-6 py-4">
+    <div class="max-w-5xl mx-auto flex items-start justify-between gap-4">
+      <div>
+        <div class="flex items-center gap-3 mb-1">
+          <h1 class="text-base font-bold text-white">RecoSys</h1>
+          <span class="text-gray-700">·</span>
+          <span class="text-gray-400 text-sm">GRU4Rec Session Recommender</span>
+        </div>
+        <p class="text-xs text-gray-600">
+          Session-based next-item prediction · REES46 eCommerce · 1M users · 222,864 items · Live inference on GCP Cloud Run
+        </p>
+      </div>
+      <div class="flex items-center gap-2 shrink-0">
+        <a href="https://github.com/sbnikhil/RecoSys" target="_blank"
+           class="text-xs text-gray-500 hover:text-gray-300 border border-gray-800 hover:border-gray-600 px-3 py-1.5 rounded transition">
+          GitHub
+        </a>
+        <a href="https://recosys-mlflow-o34zzoh3da-uc.a.run.app" target="_blank"
+           class="text-xs text-gray-500 hover:text-gray-300 border border-gray-800 hover:border-gray-600 px-3 py-1.5 rounded transition">
+          MLflow
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- ── Metrics strip ── -->
+  <div style="background: rgba(255,255,255,0.015); border-bottom: 1px solid rgba(255,255,255,0.05);" class="px-6 py-2.5">
+    <div class="max-w-5xl mx-auto flex flex-wrap items-center gap-x-6 gap-y-1 text-xs">
+      <div class="flex items-center gap-2">
+        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
+        <span class="text-gray-500">NDCG@20</span>
+        <span class="text-emerald-400 font-bold">0.2676</span>
+        <span class="text-gray-700">vs T4Rec XLNet 0.2546 (+5.1%)</span>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"></span>
+        <span class="text-gray-500">HR@20</span>
+        <span class="text-emerald-400 font-bold">0.4815</span>
+        <span class="text-gray-700">vs T4Rec XLNet 0.4565</span>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="text-gray-500">vs Popularity baseline</span>
+        <span class="text-blue-400 font-bold">7.6×</span>
+        <span class="text-gray-700">NDCG@20</span>
+      </div>
+      <div class="ml-auto flex items-center gap-1.5">
+        <span id="statusDot" class="w-1.5 h-1.5 rounded-full bg-gray-600 shrink-0"></span>
+        <span id="modelStatus" class="text-gray-600">checking model…</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Main ── -->
+  <main class="max-w-5xl mx-auto px-6 py-5 space-y-4">
+
+    <!-- Session + Recommendations row -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+      <!-- Session Builder -->
+      <div class="card p-5">
+        <h2 class="text-xs font-bold text-gray-500 uppercase tracking-widest mb-4">Build a Session</h2>
+
+        <!-- Presets -->
+        <p class="text-xs text-gray-600 mb-2">Preset sessions from the REES46 test set</p>
+        <div class="flex flex-wrap gap-2 mb-4">
+          <button onclick="loadPreset(1)"
+            class="text-xs px-3 py-1.5 rounded border border-gray-800 text-gray-400 hover:border-blue-600 hover:text-blue-300 transition">
+            1-item · view
+          </button>
+          <button onclick="loadPreset(5)"
+            class="text-xs px-3 py-1.5 rounded border border-gray-800 text-gray-400 hover:border-blue-600 hover:text-blue-300 transition">
+            5-item · views + carts
+          </button>
+          <button onclick="loadPreset(10)"
+            class="text-xs px-3 py-1.5 rounded border border-gray-800 text-gray-400 hover:border-blue-600 hover:text-blue-300 transition">
+            10-item · + purchase
+          </button>
+        </div>
+
+        <div style="border-top: 1px solid rgba(255,255,255,0.05);" class="my-3"></div>
+
+        <!-- Custom builder -->
+        <p class="text-xs text-gray-600 mb-2">Or build a custom session</p>
+        <div class="flex gap-2 mb-3">
+          <input id="itemIdInput" type="text" placeholder="Item ID (e.g. 1000544)"
+            class="flex-1 bg-gray-900 border border-gray-800 rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700
+                   focus:outline-none focus:border-blue-700 transition"
+            onkeydown="if(event.key==='Enter') addItem()">
+          <select id="eventTypeSelect"
+            class="bg-gray-900 border border-gray-800 rounded px-2 py-2 text-xs text-gray-300 focus:outline-none focus:border-blue-700 transition">
+            <option value="view">view</option>
+            <option value="cart">cart</option>
+            <option value="purchase">purchase</option>
+          </select>
+          <button onclick="addItem()"
+            class="text-xs px-3 py-2 rounded border border-blue-800 text-blue-400 hover:bg-blue-900/30 hover:border-blue-600 transition">
+            Add
+          </button>
+        </div>
+
+        <!-- Session display -->
+        <div id="sessionDisplay"
+          class="mb-4 min-h-16 rounded-lg p-3 text-xs"
+          style="background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.04);">
+          <p class="text-gray-700">Session is empty — load a preset or add items above.</p>
+        </div>
+
+        <!-- Actions -->
+        <div class="flex gap-2">
+          <button id="getRecsBtn" onclick="getRecommendations()"
+            class="btn-primary flex-1 text-white text-xs font-bold py-2.5 px-4 rounded">
+            Get Recommendations →
+          </button>
+          <button onclick="clearSession()"
+            class="text-xs px-4 py-2 border border-gray-800 text-gray-600 hover:text-gray-300 hover:border-gray-600 rounded transition">
+            Clear
+          </button>
+        </div>
+      </div>
+
+      <!-- Recommendations -->
+      <div class="card p-5">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-xs font-bold text-gray-500 uppercase tracking-widest">Recommendations</h2>
+          <span id="recsMeta" class="text-xs text-gray-700"></span>
+        </div>
+
+        <div id="recsDisplay">
+          <div class="flex flex-col items-center justify-center h-52 text-gray-700 text-xs gap-2">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+                 class="opacity-40">
+              <path d="M4 6h16M4 12h10M4 18h7"/>
+            </svg>
+            <span>Build a session and click<br>"Get Recommendations"</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Drift Monitoring ── -->
+    <div class="card p-5">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-xs font-bold text-gray-500 uppercase tracking-widest">Distribution Drift Monitor</h2>
+        <div class="flex items-center gap-1.5">
+          <span class="w-1.5 h-1.5 rounded-full bg-red-500"></span>
+          <span class="text-xs text-red-400 font-bold">ALERT TRIGGERED</span>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+
+        <!-- JSD bar -->
+        <div class="md:col-span-2">
+          <div class="flex justify-between text-xs text-gray-600 mb-1.5">
+            <span>Jensen-Shannon Divergence (normalized)</span>
+            <span>max = ln(2) ≈ 0.693</span>
+          </div>
+          <!-- Bar: JSD=0.2125, range [0, 0.693], pct=30.7%; threshold=0.10 at 14.4% -->
+          <div class="h-2.5 rounded-full overflow-hidden relative" style="background: rgba(255,255,255,0.06);">
+            <div class="h-full rounded-full bg-gradient-to-r from-amber-500 to-red-500" style="width: 30.7%;"></div>
+            <!-- threshold tick -->
+            <div class="absolute top-0 h-full w-px" style="left: 14.4%; background: rgba(156,163,175,0.5);"></div>
+          </div>
+          <div class="flex items-start justify-between text-xs mt-1.5">
+            <span class="text-gray-700">0</span>
+            <div class="text-center">
+              <span class="text-gray-600">threshold 0.10</span>
+            </div>
+            <div class="text-right">
+              <span class="text-red-400 font-bold">JSD = 0.2125</span>
+              <span class="text-gray-700 ml-2">(2.1× threshold)</span>
+            </div>
+          </div>
+
+          <p class="text-xs text-amber-400/80 mt-3 leading-relaxed">
+            Jensen-Shannon divergence of 0.212 exceeds threshold 0.10 — distribution shift detected (COVID-19 period).
+            The model trained on Jan 2020 data; March 2020 purchasing patterns diverged significantly.
+          </p>
+        </div>
+
+        <!-- Stats -->
+        <div class="space-y-2.5 text-xs">
+          <div class="flex justify-between items-center">
+            <span class="text-gray-600">Train window</span>
+            <span class="text-gray-300">Jan 2020</span>
+          </div>
+          <div class="flex justify-between items-center">
+            <span class="text-gray-600">Test window</span>
+            <span class="text-amber-400">Mar 2020 (COVID)</span>
+          </div>
+          <div style="border-top: 1px solid rgba(255,255,255,0.05);" class="pt-2 mt-2 space-y-2.5">
+            <div class="flex justify-between items-center">
+              <span class="text-gray-600">Top-50 item overlap</span>
+              <span class="text-gray-300">70.0%</span>
+            </div>
+            <div class="flex justify-between items-center">
+              <span class="text-gray-600">Test item coverage</span>
+              <span class="text-gray-300">71.3%</span>
+            </div>
+            <div class="flex justify-between items-center">
+              <span class="text-gray-600">Train events</span>
+              <span class="text-gray-300">55.97M</span>
+            </div>
+            <div class="flex justify-between items-center">
+              <span class="text-gray-600">Test events</span>
+              <span class="text-gray-300">56.34M</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Footer ── -->
+    <div class="text-center text-xs text-gray-800 pt-1 pb-4">
+      PyTorch · FAISS IndexFlatIP · FastAPI · Google Cloud Run · MLflow 2.13 · REES46 dataset ·
+      <a href="https://github.com/sbnikhil/RecoSys" target="_blank" class="text-gray-700 hover:text-gray-500 transition">
+        github.com/sbnikhil/RecoSys
+      </a>
+    </div>
+
+  </main>
+
+  <script>
+    const API_URL = '';  // Vercel /api/* routes proxy to Cloud Run
+
+    let session = [];
+
+    const PRESETS = {
+      1: [
+        { item_id: '1000544', event_type: 'view' }
+      ],
+      5: [
+        { item_id: '1000544', event_type: 'view' },
+        { item_id: '1000894', event_type: 'view' },
+        { item_id: '1000978', event_type: 'view' },
+        { item_id: '1001588', event_type: 'cart' },
+        { item_id: '1001605', event_type: 'cart' }
+      ],
+      10: [
+        { item_id: '1000544', event_type: 'view' },
+        { item_id: '1000894', event_type: 'view' },
+        { item_id: '1000978', event_type: 'view' },
+        { item_id: '1001588', event_type: 'view' },
+        { item_id: '1001605', event_type: 'view' },
+        { item_id: '1000544', event_type: 'cart' },
+        { item_id: '1000894', event_type: 'cart' },
+        { item_id: '1000978', event_type: 'cart' },
+        { item_id: '1000544', event_type: 'purchase' },
+        { item_id: '1000894', event_type: 'view' }
+      ]
+    };
+
+    function loadPreset(n) {
+      session = [...PRESETS[n]];
+      renderSession();
+    }
+
+    function addItem() {
+      const idEl = document.getElementById('itemIdInput');
+      const id = idEl.value.trim();
+      const type = document.getElementById('eventTypeSelect').value;
+      if (!id) return;
+      if (!/^\d+$/.test(id)) {
+        idEl.style.borderColor = 'rgba(239,68,68,0.6)';
+        setTimeout(() => { idEl.style.borderColor = ''; }, 1500);
+        return;
+      }
+      session.push({ item_id: id, event_type: type });
+      idEl.value = '';
+      renderSession();
+    }
+
+    function removeItem(i) {
+      session.splice(i, 1);
+      renderSession();
+    }
+
+    function clearSession() {
+      session = [];
+      renderSession();
+      document.getElementById('recsDisplay').innerHTML = emptyRecsHTML();
+      document.getElementById('recsMeta').textContent = '';
+    }
+
+    function emptyRecsHTML() {
+      return `<div class="flex flex-col items-center justify-center h-52 text-gray-700 text-xs gap-2">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="opacity-40">
+          <path d="M4 6h16M4 12h10M4 18h7"/>
+        </svg>
+        <span>Build a session and click<br>"Get Recommendations"</span>
+      </div>`;
+    }
+
+    const BADGE = { view: 'badge-view', cart: 'badge-cart', purchase: 'badge-purchase' };
+
+    function renderSession() {
+      const el = document.getElementById('sessionDisplay');
+      if (session.length === 0) {
+        el.innerHTML = '<p class="text-gray-700">Session is empty — load a preset or add items above.</p>';
+        return;
+      }
+      el.innerHTML = session.map((ev, i) => `
+        <div class="flex items-center gap-2 mb-1.5">
+          <span class="text-gray-700 w-4 text-right shrink-0">${i + 1}</span>
+          <span class="px-2 py-0.5 rounded text-xs ${BADGE[ev.event_type] || BADGE.view}">${ev.event_type}</span>
+          <span class="text-gray-300 flex-1">${ev.item_id}</span>
+          <button onclick="removeItem(${i})" class="text-gray-700 hover:text-gray-400 transition text-sm leading-none">✕</button>
+        </div>
+      `).join('');
+    }
+
+    async function getRecommendations() {
+      if (session.length === 0) return;
+
+      const btn = document.getElementById('getRecsBtn');
+      const display = document.getElementById('recsDisplay');
+
+      btn.disabled = true;
+      btn.textContent = 'Inferring…';
+      display.innerHTML = `
+        <div class="flex flex-col items-center justify-center h-52 text-gray-600 text-xs gap-3">
+          <div class="w-32 h-1 rounded-full overflow-hidden" style="background: rgba(255,255,255,0.06);">
+            <div class="shimmer h-full w-full bg-blue-600 rounded-full" style="transform-origin: left;"></div>
+          </div>
+          <span>Running GRU4Rec inference…</span>
+        </div>`;
+      document.getElementById('recsMeta').textContent = '';
+
+      try {
+        const res = await fetch(`${API_URL}/api/recommend`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session, top_k: 20 })
+        });
+
+        if (res.status === 429) {
+          display.innerHTML = errorHTML('Rate limit reached (10 req/min). Wait a moment and try again.');
+          return;
+        }
+        if (res.status === 503) {
+          display.innerHTML = errorHTML('Model is warming up (cold start ~30s). Please retry shortly.');
+          return;
+        }
+        if (res.status === 422) {
+          display.innerHTML = errorHTML('No recognized item IDs — all items are out-of-vocabulary. Try a preset session.');
+          return;
+        }
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+
+        const data = await res.json();
+        renderRecommendations(data);
+
+      } catch (e) {
+        display.innerHTML = errorHTML(`Could not reach the API. ${e.message}`);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Get Recommendations →';
+      }
+    }
+
+    function errorHTML(msg) {
+      return `<div class="flex items-center gap-2 text-xs text-red-400 p-3 rounded-lg"
+                   style="background: rgba(239,68,68,0.06); border: 1px solid rgba(239,68,68,0.15);">
+        <span class="shrink-0">⚠</span>
+        <span>${msg}</span>
+      </div>`;
+    }
+
+    function renderRecommendations(data) {
+      const display = document.getElementById('recsDisplay');
+      document.getElementById('recsMeta').textContent =
+        `${data.known_items}/${data.session_length} items known · ${data.model_version}`;
+
+      const items = data.recommendations;
+      const rows = items.map((id, i) => {
+        const isTop5 = i < 5;
+        const rank = String(i + 1).padStart(2, '0');
+        const idColor = isTop5 ? 'text-blue-300' : 'text-gray-400';
+        const dividerColor = isTop5 ? 'rgba(59,130,246,0.15)' : 'rgba(255,255,255,0.04)';
+        return `
+          <div class="rec-row flex items-center gap-3 px-2 py-1.5">
+            <span class="text-gray-700 text-xs w-6 text-right shrink-0">#${rank}</span>
+            <div class="h-px flex-1" style="background: ${dividerColor};"></div>
+            <span class="text-xs ${idColor}">${id}</span>
+          </div>`;
+      }).join('');
+
+      display.innerHTML = rows + `
+        <p class="text-gray-700 text-xs mt-2 px-2">
+          Real product IDs from the REES46 eCommerce dataset (222,864 unique items)
+        </p>`;
+    }
+
+    // ── Health check on load ──
+    async function checkHealth() {
+      const dot = document.getElementById('statusDot');
+      const label = document.getElementById('modelStatus');
+      try {
+        const res = await fetch(`${API_URL}/api/health`);
+        if (res.ok) {
+          const h = await res.json();
+          dot.className = 'w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0';
+          label.textContent = `model ready · ${h.n_items_indexed.toLocaleString()} items indexed`;
+          label.className = 'text-emerald-500 text-xs';
+        } else if (res.status === 503) {
+          dot.className = 'w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0';
+          label.textContent = 'model warming up…';
+          label.className = 'text-amber-400 text-xs';
+          setTimeout(checkHealth, 8000);
+        } else {
+          throw new Error(`HTTP ${res.status}`);
+        }
+      } catch {
+        dot.className = 'w-1.5 h-1.5 rounded-full bg-red-500 shrink-0';
+        label.textContent = 'model offline';
+        label.className = 'text-red-400 text-xs';
+      }
+    }
+
+    checkHealth();
+  </script>
+</body>
+</html>

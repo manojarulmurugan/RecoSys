@@ -12,5 +12,7 @@ faiss-cpu>=1.7.4
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 httpx>=0.26.0
+slowapi>=0.1.9
+limits>=3.0.0
 # monitoring
 scipy>=1.11.0

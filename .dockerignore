@@ -8,6 +8,7 @@ __pycache__/
 *.pyo
 *.pyd
 reports/
+!reports/drift_report.json
 docs/
 *.md
 .env
