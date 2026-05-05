@@ -11,16 +11,22 @@ Environment variables:
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated
 
 import faiss
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from src.serving.model_loader import EVENT_TYPE_MAP, ServingArtifacts, load_artifacts
 
@@ -38,6 +44,15 @@ _MAX_TOP_K   = 50
 
 _artifacts:     ServingArtifacts | None = None
 _loading_error: str | None              = None
+
+# Drift report is baked into the Docker image at /app/drift_report.json;
+# fall back to the local repo path when running outside Docker.
+_DRIFT_PATHS = [
+    Path("/app/drift_report.json"),
+    Path("reports/drift_report.json"),
+]
+
+limiter = Limiter(key_func=get_remote_address)
 
 
 def _load_in_background() -> None:
@@ -66,6 +81,15 @@ app = FastAPI(
     description="Session-based next-item recommendations. NDCG@20=0.2676 on REES46 1M-user dataset.",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 
@@ -119,8 +143,17 @@ def recommend_example():
     }
 
 
+@app.get("/drift")
+def drift_report():
+    for path in _DRIFT_PATHS:
+        if path.exists():
+            return json.loads(path.read_text())
+    raise HTTPException(404, "Drift report not available")
+
+
 @app.post("/recommend", response_model=RecommendResponse)
-def recommend(req: RecommendRequest):
+@limiter.limit("10/minute")
+def recommend(request: Request, req: RecommendRequest):
     if _artifacts is None:
         raise HTTPException(503, "Model not loaded")
 
